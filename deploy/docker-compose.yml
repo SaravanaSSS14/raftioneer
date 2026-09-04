@@ -1,0 +1,47 @@
+services:
+  llm_server:
+    build:
+      context: ..
+      dockerfile: llm_server/Dockerfile
+    environment:
+      - NODE_ID=llm-server
+      - PORT=50060
+
+  app_server_1:
+    build:
+      context: ..
+      dockerfile: app_server/Dockerfile
+    environment:
+      - NODE_ID=app-server-1
+      - PORT=50051
+      - PEERS=app_server_2:50051,app_server_3:50051
+
+  app_server_2:
+    build:
+      context: ..
+      dockerfile: app_server/Dockerfile
+    environment:
+      - NODE_ID=app-server-2
+      - PORT=50051
+      - PEERS=app_server_1:50051,app_server_3:50051
+
+  app_server_3:
+    build:
+      context: ..
+      dockerfile: app_server/Dockerfile
+    environment:
+      - NODE_ID=app-server-3
+      - PORT=50051
+      - PEERS=app_server_1:50051,app_server_2:50051
+
+  client:
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
+    environment:
+      - NODE_ID=client
+      - APP_SERVERS=app_server_1:50051,app_server_2:50051,app_server_3:50051
+    depends_on:
+      - app_server_1
+      - app_server_2
+      - app_server_3

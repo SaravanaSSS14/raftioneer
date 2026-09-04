@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package raftioneer.auction;
+
+// DRAFT — client-facing contract between the app-server (Member A) and
+// business-logic layer (Member B). Frozen once both members sign off;
+// after that, method signature changes require a heads-up before either
+// side implements against them (see CLAUDE.md conventions).
+
+// ---- Domain messages ----
+
+message Item {
+  string item_id = 1;
+  string title = 2;
+  string description = 3;
+  string seller_id = 4;
+}
+
+message Bid {
+  string bid_id = 1;
+  string auction_id = 2;
+  string bidder_id = 3;
+  double amount = 4;
+  int64 timestamp_ms = 5;
+}
+
+enum AuctionStatus {
+  AUCTION_STATUS_UNSPECIFIED = 0;
+  PENDING = 1;
+  ACTIVE = 2;
+  CLOSED = 3;
+}
+
+message Auction {
+  string auction_id = 1;
+  Item item = 2;
+  AuctionStatus status = 3;
+  double current_highest_bid = 4;
+  string current_highest_bidder_id = 5;
+  int64 end_time_ms = 6;
+  double reserve_price = 7; // 0 = no reserve; optional extension (Section 10, reference doc)
+}
+
+// ---- Auth ----
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  bool success = 1;
+  string session_token = 2;
+  string user_id = 3;
+  string error_message = 4;
+}
+
+message LogoutRequest {
+  string session_token = 1;
+}
+
+message LogoutResponse {
+  bool success = 1;
+}
+
+// ---- Browsing ----
+
+message ListAuctionsRequest {
+  AuctionStatus status_filter = 1; // UNSPECIFIED = all
+}
+
+message ListAuctionsResponse {
+  repeated Auction auctions = 1;
+}
+
+message GetAuctionRequest {
+  string auction_id = 1;
+}
+
+message GetAuctionResponse {
+  bool found = 1;
+  Auction auction = 2;
+}
+
+// ---- Bid placement ----
+
+message PlaceBidRequest {
+  string session_token = 1;
+  string auction_id = 2;
+  double amount = 3;
+}
+
+message PlaceBidResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // Set when this node is not the current Raft leader, so the client
+  // (or app-server-to-app-server redirect logic) knows where to retry.
+  string leader_hint = 3;
+  Auction updated_auction = 4;
+}
+
+service AuctionService {
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+  rpc ListAuctions(ListAuctionsRequest) returns (ListAuctionsResponse);
+  rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
+  // Accepted only by the current Raft leader; followers respond with
+  // accepted=false and leader_hint set (see CLAUDE.md, Architecture).
+  rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
+}

@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package raftioneer.llm;
+
+// Contract for the independent LLM server (Node 1). Called by app
+// servers over gRPC only; holds no authoritative auction state.
+
+message GetLLMAnswerRequest {
+  string question = 1;
+  string context = 2; // relevant item/auction info injected by the app server
+}
+
+message GetLLMAnswerResponse {
+  string answer = 1;
+}
+
+message GenerateItemDescriptionRequest {
+  string title = 1;
+  repeated string keywords = 2;
+}
+
+message GenerateItemDescriptionResponse {
+  string description = 1;
+}
+
+message SummarizeAuctionRequest {
+  string auction_id = 1;
+  string item_title = 2;
+  repeated double bid_history = 3;
+  double final_price = 4;
+}
+
+message SummarizeAuctionResponse {
+  string summary = 1;
+}
+
+service LLMService {
+  rpc GetLLMAnswer(GetLLMAnswerRequest) returns (GetLLMAnswerResponse);
+  rpc GenerateItemDescription(GenerateItemDescriptionRequest) returns (GenerateItemDescriptionResponse);
+  rpc SummarizeAuction(SummarizeAuctionRequest) returns (SummarizeAuctionResponse);
+}

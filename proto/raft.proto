@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package raftioneer.raft;
+
+// Internal peer-to-peer contract between app-server nodes. Follows
+// Ongaro & Ousterhout, "In Search of an Understandable Consensus
+// Algorithm", Figure 2 — field names mirror the paper's RPC arguments
+// so the implementation can be checked against the spec directly.
+
+message LogEntry {
+  int64 term = 1;
+  int64 index = 2;
+  bytes command = 3; // serialized AuctionService write (e.g. a PlaceBidRequest)
+}
+
+message RequestVoteRequest {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  int64 term = 1;
+  string leader_id = 2;
+  int64 prev_log_index = 3;
+  int64 prev_log_term = 4;
+  repeated LogEntry entries = 5; // empty = heartbeat
+  int64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+  int64 term = 1;
+  bool success = 2;
+  // Not in the paper's minimal RPC, but a common accepted optimization
+  // for faster nextIndex backtracking on conflict.
+  int64 match_index = 3;
+}
+
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}

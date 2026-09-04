@@ -1,9 +1,7 @@
 # Raftioneer — Distributed Online Auction System
 
 Fault-tolerant online auction platform built on gRPC and a custom Raft
-implementation. See the top-level `Raftioneer_Project_Reference.md`
-(one directory up) for the full project abstract, architecture, work
-split, and schedule. See `CLAUDE.md` for engineering conventions.
+implementation.
 
 ## Repository Layout
 

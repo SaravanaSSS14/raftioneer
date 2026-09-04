@@ -6,6 +6,8 @@ services:
     environment:
       - NODE_ID=llm-server
       - PORT=50060
+    ports:
+      - "50060:50060"
 
   app_server_1:
     build:
@@ -15,6 +17,8 @@ services:
       - NODE_ID=app-server-1
       - PORT=50051
       - PEERS=app_server_2:50051,app_server_3:50051
+    ports:
+      - "50051:50051"
 
   app_server_2:
     build:
@@ -24,6 +28,8 @@ services:
       - NODE_ID=app-server-2
       - PORT=50051
       - PEERS=app_server_1:50051,app_server_3:50051
+    ports:
+      - "50052:50051"
 
   app_server_3:
     build:
@@ -33,6 +39,8 @@ services:
       - NODE_ID=app-server-3
       - PORT=50051
       - PEERS=app_server_1:50051,app_server_2:50051
+    ports:
+      - "50053:50051"
 
   client:
     build:

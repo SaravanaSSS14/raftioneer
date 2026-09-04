@@ -35,6 +35,20 @@ Brings up 5 nodes: the LLM server, three app-server replicas
 (`app_server_1/2/3`), and a client that polls each app server's
 `AuctionService` over gRPC to confirm reachability.
 
+App servers are published on the host at `localhost:50051/50052/50053`,
+the LLM server at `localhost:50060`.
+
+## Smoke Testing
+
+With the stack up, verify every service responds to a real gRPC call
+against the frozen contract (not just "container is running"):
+
+```bash
+source venv/bin/activate
+./scripts/generate_protos.sh
+python scripts/smoke_test.py
+```
+
 ## Status
 
 Week 1 skeleton: `.proto` contracts drafted, all five services build

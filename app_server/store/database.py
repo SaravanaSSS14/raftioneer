@@ -19,7 +19,20 @@ def init_database():
     conn = get_connection()
     try:
         conn.execute("PRAGMA foreign_keys = ON")
-        
+
+        # Create Users table - stores the password hash to actually
+        # verify against. Previously missing entirely: Login computed
+        # a hash but never checked it against anything, so any
+        # username/password pair succeeded.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
         # Create Sessions table for user authentication
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -80,7 +93,35 @@ def init_database():
         conn.close()
 
 
-def create_session(username: str, session_token: str, user_id: str, 
+def get_user(username: str) -> Optional[dict]:
+    """Look up a user's stored credentials by username."""
+    conn = get_connection()
+    try:
+        result = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(result) if result else None
+    finally:
+        conn.close()
+
+
+def create_user(username: str, user_id: str, password_hash: str) -> bool:
+    """Register a new user with a hashed password. Returns False if
+    the username or user_id already exists."""
+    conn = get_connection()
+    try:
+        now_ms = datetime.now().timestamp() * 1000
+        conn.execute("""
+            INSERT INTO users (username, user_id, password_hash, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (username, user_id, password_hash, now_ms))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def create_session(username: str, session_token: str, user_id: str,
                    expires_in_minutes: int = 60) -> Optional[str]:
     """Create a new session and return the token if successful."""
     conn = get_connection()
@@ -225,6 +266,7 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
         
         if now_ms >= auction["end_time_ms"]:
             conn.execute("""UPDATE auctions SET status = 'CLOSED' WHERE auction_id = ?""", (auction_id,))
+            conn.commit()  # was missing - this status change would have been silently rolled back
             return False, "Auction has ended"
         
         current_bid = auction["current_highest_bid"] or 0.0
@@ -254,6 +296,40 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
         
     except sqlite3.Error as e:
         return False, str(e)
+    finally:
+        conn.close()
+
+
+def close_expired_auctions(now_ms: int) -> list[dict]:
+    """Proactively closes ACTIVE auctions past their end_time_ms and
+    returns the ones just closed, for winner-determination/logging.
+
+    Without this, an auction only ever closed reactively - if someone
+    happened to try bidding on it after it expired (see create_bid
+    above). If nobody did, it stayed ACTIVE forever and no winner was
+    ever recorded. current_highest_bidder_id at close time IS the
+    winner (or "" if no bids were placed) - PlaceBid already refuses
+    bids against a non-ACTIVE auction, so this field can't change
+    again once closed.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT a.*, i.title, i.description, i.seller_id
+            FROM auctions a
+            JOIN items i ON a.item_id = i.item_id
+            WHERE a.status = 'ACTIVE' AND a.end_time_ms <= ?
+        """, (now_ms,)).fetchall()
+
+        closed = []
+        for row in rows:
+            conn.execute("UPDATE auctions SET status = 'CLOSED' WHERE auction_id = ?", (row["auction_id"],))
+            record = dict(row)
+            record["status"] = "CLOSED"
+            closed.append(record)
+
+        conn.commit()
+        return closed
     finally:
         conn.close()
 

@@ -22,46 +22,68 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
     """Business logic implementation for auction operations."""
 
     async def Login(self, request, context):
-        """Handle user login with username/password validation.
-        
+        """Handle user login with real password verification.
+
+        No separate Register RPC exists in the contract, so this uses
+        an auto-register-on-first-use pattern: the first successful
+        login for a username sets its password (hashed); every login
+        after that must match it. Previously this method computed a
+        hash and then never checked it against anything - any
+        username/password pair succeeded, including impersonating an
+        existing username.
+
         Args:
             request: Contains username and password fields
             context: gRPC metadata including any auth headers
-        
+
         Returns:
             LoginResponse with session token on success
         """
         try:
             username = request.username.strip() if request.username else ""
             password = request.password or ""
-            
+
             if not username or not password:
                 log.info("Login rejected - empty credentials")
                 return auction_pb2.LoginResponse(
                     success=False, error_message="Username and password required",
                     session_token="", user_id=""
                 )
-            
-            # Hash provided password
+
             password_hash = auth.hash_password(password)
+            existing_user = database.get_user(username)
+
+            if existing_user is None:
+                user_id = f"user_{username}"
+                database.create_user(username, user_id, password_hash)
+                log.info("Registered new user %s", username)
+            else:
+                if not auth.validate_password_stored(password, existing_user["password_hash"]):
+                    log.info("Login rejected - wrong password for %s", username)
+                    return auction_pb2.LoginResponse(
+                        success=False, error_message="Invalid username or password",
+                        session_token="", user_id=""
+                    )
+                user_id = existing_user["user_id"]
+
             conn = database.get_connection()
-            
-            # Create new session for first-time users or existing ones
+
             session_token = auth.generate_session_token()
             now_ms = datetime.datetime.now().timestamp() * 1000
-            
+
             conn.execute("""
-                INSERT OR REPLACE INTO sessions 
+                INSERT OR REPLACE INTO sessions
                 (session_token, user_id, username, created_at, expires_at)
                 VALUES (?, ?, ?, ?, ?)
-            """, (session_token, username, username, now_ms, now_ms + 3600000))
-            
+            """, (session_token, user_id, username, now_ms, now_ms + 3600000))
+
             conn.commit()
-            
+            conn.close()
+
             return auction_pb2.LoginResponse(
-                success=True, session_token=session_token, user_id=username, error_message=""
+                success=True, session_token=session_token, user_id=user_id, error_message=""
             )
-        
+
         except Exception as e:
             log.exception(f"Login failed for {request.username}")
             return auction_pb2.LoginResponse(success=False, error_message=str(e))
@@ -280,6 +302,36 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             )
 
 
+TIMER_TICK_SECONDS = 1
+
+
+async def run_auction_timer():
+    """Closes auctions whose clock has run out and logs the winner.
+
+    Previously this didn't exist at all - an auction only closed
+    reactively, if someone happened to try bidding on it after
+    expiry (see create_bid). If nobody did, it stayed ACTIVE forever
+    and no winner was ever recorded.
+
+    M1 scope: runs in-process, local to this single app_server - no
+    Raft yet. Week 5+ replaces this with Raft-replicated timer state
+    per CLAUDE.md's architecture constraint (timer state must not
+    live in local process memory once Raft exists).
+    """
+    while True:
+        now_ms = int(datetime.datetime.now().timestamp() * 1000)
+        for record in database.close_expired_auctions(now_ms):
+            if record["current_highest_bidder_id"]:
+                log.info(
+                    "auction %s closed - winner=%s amount=%s (item=%s)",
+                    record["auction_id"], record["current_highest_bidder_id"],
+                    record["current_highest_bid"], record["title"],
+                )
+            else:
+                log.info("auction %s closed - no bids placed (item=%s)", record["auction_id"], record["title"])
+        await asyncio.sleep(TIMER_TICK_SECONDS)
+
+
 async def serve():
     """Start gRPC server."""
     # database.init_database() was defined but never called anywhere -
@@ -291,7 +343,12 @@ async def serve():
     server.add_insecure_port(f"[::]:{PORT}")
     log.info("app server starting on port %s", PORT)
     await server.start()
-    await server.wait_for_termination()
+
+    timer_task = asyncio.create_task(run_auction_timer())
+    try:
+        await server.wait_for_termination()
+    finally:
+        timer_task.cancel()
 
 
 if __name__ == "__main__":

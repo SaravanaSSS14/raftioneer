@@ -11,7 +11,8 @@ app_server/     # Raft + business logic (the auction node)
 llm_server/     # LLM integration, isolated service
 client/         # CLI client + bidder-simulation script
 deploy/         # docker-compose.yml
-scripts/        # dev tooling (proto generation, etc.)
+scripts/        # dev tooling (proto generation, manual smoke test)
+tests/          # pytest contract tests, run against a live stack
 generated/      # gRPC stubs generated from proto/ — gitignored, not committed
 ```
 
@@ -20,7 +21,7 @@ generated/      # gRPC stubs generated from proto/ — gitignored, not committed
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r app_server/requirements.txt
+pip install -r requirements-dev.txt
 
 ./scripts/generate_protos.sh   # regenerate generated/*_pb2*.py from proto/
 ```
@@ -38,19 +39,26 @@ Brings up 5 nodes: the LLM server, three app-server replicas
 App servers are published on the host at `localhost:50051/50052/50053`,
 the LLM server at `localhost:50060`.
 
-## Smoke Testing
+## Testing
 
-With the stack up, verify every service responds to a real gRPC call
-against the frozen contract (not just "container is running"):
+With the stack up (Compose, or services run locally on matching ports):
 
 ```bash
 source venv/bin/activate
 ./scripts/generate_protos.sh
-python scripts/smoke_test.py
+
+python scripts/smoke_test.py   # quick manual check, readable OK/FAIL output
+pytest tests/                  # full contract test suite, CI-friendly
 ```
+
+Both check contract-level invariants (e.g. a bid without a valid
+session is never accepted) rather than specific seed data — they pass
+regardless of how business logic is implemented internally.
 
 ## Status
 
-Week 1 skeleton: `.proto` contracts drafted, all five services build
-and respond to gRPC calls with stub logic. No Raft, auth, or business
-logic yet — see `CLAUDE.md` → Progress Log for current state.
+`.proto` contracts drafted (pending Member B's sign-off), all five
+services build and respond to gRPC calls. Infra, client, and testing
+are in place; auth, bid/auction business logic, and real LLM
+integration are still stub code — see `CLAUDE.md` → Progress Log for
+current state.

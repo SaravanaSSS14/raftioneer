@@ -126,10 +126,13 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             ListAuctionsResponse with auction list
         """
         try:
-            # Get status filter if present
+            # Get status filter if present. request.status_filter is a
+            # plain int on the message (protobuf enum fields are never
+            # wrapped in an object with .name/.value) - the string name
+            # has to be looked up explicitly via AuctionStatus.Name().
             status_filter = None
-            if hasattr(request, 'status_filter') and request.status_filter:
-                status_filter = request.status_filter.name
+            if request.status_filter:
+                status_filter = auction_pb2.AuctionStatus.Name(request.status_filter)
             
             auctions = database.get_all_auctions(status_filter=status_filter)
             

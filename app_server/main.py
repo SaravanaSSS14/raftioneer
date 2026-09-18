@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 import os
+import uuid
 
 import grpc
 
@@ -119,7 +120,7 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=a["description"], 
                         seller_id=a["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(a["status"])),
+                    status=auction_pb2.AuctionStatus.Value(a["status"]),
                     current_highest_bid=float(a["current_highest_bid"]),
                     current_highest_bidder_id=a["current_highest_bidder_id"] or "",
                     end_time_ms=int(a["end_time_ms"]),
@@ -157,7 +158,7 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=auction["description"], 
                         seller_id=auction["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(auction["status"])),
+                    status=auction_pb2.AuctionStatus.Value(auction["status"]),
                     current_highest_bid=float(auction["current_highest_bid"]),
                     current_highest_bidder_id=auction["current_highest_bidder_id"] or "",
                     end_time_ms=int(auction["end_time_ms"]),
@@ -168,6 +169,46 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
         except Exception as e:
             log.exception(f"GetAuction failed for {request.auction_id}")
             return auction_pb2.GetAuctionResponse(found=False)
+
+    async def CreateAuction(self, request, context):
+        """Create an item and an immediately-active auction for it.
+
+        Added post-freeze: there was previously no way for any client
+        to get real data into the system at all (see
+        Raftioneer_Bug_Solutions_Guide.pdf, Bug 6). Session-gated
+        (any logged-in user may list an item) rather than a separate
+        seller role, to keep this addition minimal.
+        """
+        try:
+            session = database.validate_session(request.session_token)
+            if not session:
+                return auction_pb2.CreateAuctionResponse(
+                    success=False, error_message="Invalid or expired session token"
+                )
+
+            if not request.title.strip():
+                return auction_pb2.CreateAuctionResponse(success=False, error_message="Title is required")
+
+            duration_seconds = request.duration_seconds if request.duration_seconds > 0 else 3600
+            auction_id = str(uuid.uuid4())[:8]
+
+            created = database.create_item(
+                item_id=auction_id,
+                title=request.title,
+                description=request.description,
+                seller_id=session["user_id"],
+                duration_seconds=duration_seconds,
+                reserve_price=request.reserve_price,
+            )
+            if not created:
+                return auction_pb2.CreateAuctionResponse(success=False, error_message="Could not create auction")
+
+            log.info("CreateAuction(auction_id=%s, title=%s) by %s", auction_id, request.title, session["user_id"])
+            return auction_pb2.CreateAuctionResponse(success=True, auction_id=auction_id)
+
+        except Exception as e:
+            log.exception("CreateAuction failed")
+            return auction_pb2.CreateAuctionResponse(success=False, error_message=str(e))
 
     async def PlaceBid(self, request, context):
         """Place a bid on an auction.
@@ -221,7 +262,7 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=auction["description"], 
                         seller_id=auction["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(auction["status"])),
+                    status=auction_pb2.AuctionStatus.Value(auction["status"]),
                     current_highest_bid=float(auction["current_highest_bid"]),
                     current_highest_bidder_id=auction["current_highest_bidder_id"] or "",
                     end_time_ms=int(auction["end_time_ms"]),

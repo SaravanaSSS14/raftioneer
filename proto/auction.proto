@@ -82,6 +82,26 @@ message GetAuctionResponse {
   Auction auction = 2;
 }
 
+// ---- Auction creation ----
+// Added post-freeze: there was no way for any client to get an item
+// or auction into the system at all. Session-gated (any logged-in
+// user can list an item) rather than a separate seller role, to keep
+// M1 scope minimal.
+
+message CreateAuctionRequest {
+  string session_token = 1;
+  string title = 2;
+  string description = 3;
+  int64 duration_seconds = 4;
+  double reserve_price = 5; // 0 = no reserve
+}
+
+message CreateAuctionResponse {
+  bool success = 1;
+  string error_message = 2;
+  string auction_id = 3;
+}
+
 // ---- Bid placement ----
 
 message PlaceBidRequest {
@@ -104,6 +124,7 @@ service AuctionService {
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc ListAuctions(ListAuctionsRequest) returns (ListAuctionsResponse);
   rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
+  rpc CreateAuction(CreateAuctionRequest) returns (CreateAuctionResponse);
   // Accepted only by the current Raft leader; followers respond with
   // accepted=false and leader_hint set (see CLAUDE.md, Architecture).
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);

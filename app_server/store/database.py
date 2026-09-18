@@ -167,25 +167,36 @@ def get_auction(auction_id: str) -> Optional[dict]:
         conn.close()
 
 
-def create_item(item_id: str, title: str, description: str, seller_id: str) -> bool:
-    """Create a new item for auction."""
+def create_item(item_id: str, title: str, description: str, seller_id: str,
+                 duration_seconds: int = 3600, reserve_price: float = 0.0) -> bool:
+    """Create a new item and an immediately-active auction for it.
+
+    Bug fixes applied here (see Raftioneer_Bug_Solutions_Guide.pdf, Bug 6):
+    the INSERT INTO auctions statement named 9 columns but supplied only
+    6 values (a placeholder-count mismatch) - fixed by matching column
+    and value lists 1:1. Separately, this function never called
+    conn.commit(), so even correct SQL would have been silently rolled
+    back when the connection closed - added below.
+    """
     conn = get_connection()
     try:
         existing = conn.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
-        
+
         if not existing:
             conn.execute("""
                 INSERT INTO items (item_id, title, description, seller_id)
                 VALUES (?, ?, ?, ?)
             """, (item_id, title, description, seller_id))
-            
+
             now_ms = datetime.now().timestamp() * 1000
+            end_time_ms = now_ms + duration_seconds * 1000
             conn.execute("""
-                INSERT INTO auctions (auction_id, item_id, title, description, seller_id, 
-                                     status, current_highest_bid, current_highest_bidder_id, end_time_ms)
-                VALUES (?, ?, ?, ?, ?, 'PENDING', 0.0, ?, ?)
-            """, (item_id, item_id, title, description, seller_id, now_ms + 60 * 60 * 1000))
-        
+                INSERT INTO auctions (auction_id, item_id, title, description, seller_id,
+                                     status, current_highest_bid, current_highest_bidder_id, end_time_ms, reserve_price)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?, ?, ?)
+            """, (item_id, item_id, title, description, seller_id, None, end_time_ms, reserve_price))
+
+        conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Manual smoke test against a running `docker compose up` stack.
 
-Not a pytest suite (there's no business logic yet to unit-test) — this
-is a quick, repeatable replacement for "eyeball the logs" when checking
-that the .proto contract is actually wired up end-to-end across all
-three app-server replicas and the LLM server.
+Deliberately generic: it checks contract-level invariants that must
+hold no matter how business logic (owned by Member B) is implemented
+internally — it does NOT assume specific seed users, item names, or
+auction ids, since those are his implementation details, not part of
+the frozen .proto contract.
 
 Usage (with the stack already up):
     source venv/bin/activate
@@ -12,6 +13,7 @@ Usage (with the stack already up):
     python scripts/smoke_test.py
 """
 import sys
+import uuid
 
 import grpc
 
@@ -31,11 +33,41 @@ def check_app_server(address: str) -> bool:
     try:
         with grpc.insecure_channel(address) as channel:
             stub = auction_pb2_grpc.AuctionServiceStub(channel)
+
+            # Login must be well-formed: a "success" response always
+            # carries a session token, a failed one never does.
+            login = stub.Login(
+                auction_pb2.LoginRequest(username="smoke-test", password="wrong"),
+                timeout=TIMEOUT_SECONDS,
+            )
+            assert not (login.success and not login.session_token), (
+                "Login reported success but returned no session_token"
+            )
+
+            # ListAuctions must respond without error, filtered or not.
             stub.ListAuctions(auction_pb2.ListAuctionsRequest(), timeout=TIMEOUT_SECONDS)
-        print(f"OK   {address}  (AuctionService.ListAuctions responded)")
+
+            # A random, essentially-guaranteed-nonexistent auction id
+            # must never be reported as found.
+            bogus_id = f"smoke-test-{uuid.uuid4()}"
+            got = stub.GetAuction(auction_pb2.GetAuctionRequest(auction_id=bogus_id), timeout=TIMEOUT_SECONDS)
+            assert not got.found, f"GetAuction reported found=True for a made-up id ({bogus_id})"
+
+            # Security invariant: a bid with no valid session must
+            # never be accepted, regardless of internal bid logic.
+            bid = stub.PlaceBid(
+                auction_pb2.PlaceBidRequest(session_token="", auction_id=bogus_id, amount=1.0),
+                timeout=TIMEOUT_SECONDS,
+            )
+            assert not bid.accepted, "PlaceBid accepted a bid with an empty session_token"
+
+            # Logout must not error, valid session or not.
+            stub.Logout(auction_pb2.LogoutRequest(session_token=""), timeout=TIMEOUT_SECONDS)
+
+        print(f"OK   {address}  (Login, ListAuctions, GetAuction, PlaceBid, Logout all well-formed)")
         return True
-    except grpc.RpcError as exc:
-        print(f"FAIL {address}  ({exc.code()})")
+    except (grpc.RpcError, AssertionError) as exc:
+        print(f"FAIL {address}  ({exc})")
         return False
 
 
@@ -55,9 +87,9 @@ def main() -> int:
     results = [check_app_server(addr) for addr in APP_SERVERS]
     results.append(check_llm_server(LLM_SERVER))
     if all(results):
-        print("\nAll services reachable and responding to the frozen .proto contract.")
+        print("\nAll services reachable and honoring the frozen .proto contract.")
         return 0
-    print("\nSome services did not respond — check `docker compose ps` / logs.")
+    print("\nSome checks failed — see above.")
     return 1
 
 

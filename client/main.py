@@ -4,8 +4,8 @@ import os
 
 import grpc
 
-import auction_pb2
-import auction_pb2_grpc
+from generated import auction_pb2
+from generated import auction_pb2_grpc
 
 NODE_ID = os.environ.get("NODE_ID", "client")
 APP_SERVERS = [s for s in os.environ.get("APP_SERVERS", "").split(",") if s]

@@ -4,8 +4,8 @@ import os
 
 import grpc
 
-import llm_pb2
-import llm_pb2_grpc
+from generated import llm_pb2
+from generated import llm_pb2_grpc
 
 NODE_ID = os.environ.get("NODE_ID", "llm-server")
 PORT = os.environ.get("PORT", "50060")

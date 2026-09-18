@@ -5,7 +5,8 @@ import os
 
 import grpc
 
-from generated import auction_pb2, auction_pb2_grpc
+import auction_pb2
+import auction_pb2_grpc
 from store import database, auth
 
 
@@ -118,7 +119,7 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=a["description"], 
                         seller_id=a["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value({a["status"]})),
+                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(a["status"])),
                     current_highest_bid=float(a["current_highest_bid"]),
                     current_highest_bidder_id=a["current_highest_bidder_id"] or "",
                     end_time_ms=int(a["end_time_ms"]),
@@ -156,14 +157,14 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=auction["description"], 
                         seller_id=auction["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value({auction["status"]})),
+                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(auction["status"])),
                     current_highest_bid=float(auction["current_highest_bid"]),
                     current_highest_bidder_id=auction["current_highest_bidder_id"] or "",
                     end_time_ms=int(auction["end_time_ms"]),
                     reserve_price=float(auction.get("reserve_price", 0.0))
                 )
             )
-        
+
         except Exception as e:
             log.exception(f"GetAuction failed for {request.auction_id}")
             return auction_pb2.GetAuctionResponse(found=False)
@@ -220,14 +221,14 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                         description=auction["description"], 
                         seller_id=auction["seller_id"]
                     ),
-                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value({auction["status"]})),
+                    status=auction_pb2.AuctionStatus(auction_pb2.AuctionStatus.Value(auction["status"])),
                     current_highest_bid=float(auction["current_highest_bid"]),
                     current_highest_bidder_id=auction["current_highest_bidder_id"] or "",
                     end_time_ms=int(auction["end_time_ms"]),
                     reserve_price=float(auction.get("reserve_price", 0.0))
                 )
             )
-        
+
         except Exception as e:
             log.exception(f"PlaceBid failed for {request.auction_id}")
             return auction_pb2.PlaceBidResponse(
@@ -240,6 +241,10 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
 
 async def serve():
     """Start gRPC server."""
+    # database.init_database() was defined but never called anywhere -
+    # the schema never got applied, so every query would fail with
+    # "no such table" before any business logic even ran.
+    database.init_database()
     server = grpc.aio.server()
     auction_pb2_grpc.add_AuctionServiceServicer_to_server(AuctionServiceServicer(), server)
     server.add_insecure_port(f"[::]:{PORT}")

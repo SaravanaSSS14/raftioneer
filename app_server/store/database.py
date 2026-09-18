@@ -200,10 +200,15 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
         now_ms = datetime.now().timestamp() * 1000
         
         auction = conn.execute("""SELECT * FROM auctions WHERE auction_id = ?""", (auction_id,)).fetchone()
-        
+
         if not auction:
             return False, "Auction not found"
-        
+
+        # sqlite3.Row supports [] but not .get() - convert once so both
+        # work below (bug: auction.get(...) on a raw Row raised AttributeError
+        # on every bid that was otherwise valid, before the INSERT ever ran).
+        auction = dict(auction)
+
         if auction["status"] != "ACTIVE":
             return False, f"Auction is {auction['status']}, cannot place bid"
         

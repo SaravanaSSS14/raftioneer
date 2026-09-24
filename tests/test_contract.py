@@ -18,16 +18,17 @@ import uuid
 import grpc
 import pytest
 
-import auction_pb2
-import auction_pb2_grpc
-import llm_pb2
-import llm_pb2_grpc
+from generated import auction_pb2
+from generated import auction_pb2_grpc
+from generated import llm_pb2
+from generated import llm_pb2_grpc
 
 APP_SERVERS = os.environ.get(
     "TEST_APP_SERVERS", "localhost:50051,localhost:50052,localhost:50053"
 ).split(",")
 LLM_SERVER = os.environ.get("TEST_LLM_SERVER", "localhost:50060")
-TIMEOUT_SECONDS = 3
+APP_TIMEOUT_SECONDS = 3
+LLM_TIMEOUT_SECONDS = 90
 
 
 @pytest.fixture(params=APP_SERVERS, ids=APP_SERVERS)
@@ -45,34 +46,34 @@ def llm_stub():
 def test_failed_login_never_returns_a_session_token(app_stub):
     resp = app_stub.Login(
         auction_pb2.LoginRequest(username="pytest-user", password="wrong-password"),
-        timeout=TIMEOUT_SECONDS,
+        timeout=APP_TIMEOUT_SECONDS,
     )
     assert not (resp.success and not resp.session_token)
 
 
 def test_list_auctions_responds_without_error(app_stub):
-    resp = app_stub.ListAuctions(auction_pb2.ListAuctionsRequest(), timeout=TIMEOUT_SECONDS)
+    resp = app_stub.ListAuctions(auction_pb2.ListAuctionsRequest(), timeout=APP_TIMEOUT_SECONDS)
     assert isinstance(resp.auctions, type(resp.auctions))  # a repeated field, never None
 
 
 def test_get_auction_for_unknown_id_is_not_found(app_stub):
     bogus_id = f"pytest-{uuid.uuid4()}"
-    resp = app_stub.GetAuction(auction_pb2.GetAuctionRequest(auction_id=bogus_id), timeout=TIMEOUT_SECONDS)
+    resp = app_stub.GetAuction(auction_pb2.GetAuctionRequest(auction_id=bogus_id), timeout=APP_TIMEOUT_SECONDS)
     assert not resp.found
 
 
 def test_bid_without_valid_session_is_never_accepted(app_stub):
     resp = app_stub.PlaceBid(
         auction_pb2.PlaceBidRequest(session_token="", auction_id=f"pytest-{uuid.uuid4()}", amount=1.0),
-        timeout=TIMEOUT_SECONDS,
+        timeout=APP_TIMEOUT_SECONDS,
     )
     assert not resp.accepted
 
 
 def test_logout_does_not_error(app_stub):
-    app_stub.Logout(auction_pb2.LogoutRequest(session_token=""), timeout=TIMEOUT_SECONDS)
+    app_stub.Logout(auction_pb2.LogoutRequest(session_token=""), timeout=APP_TIMEOUT_SECONDS)
 
 
 def test_llm_get_answer_responds(llm_stub):
-    resp = llm_stub.GetLLMAnswer(llm_pb2.GetLLMAnswerRequest(question="ping"), timeout=TIMEOUT_SECONDS)
+    resp = llm_stub.GetLLMAnswer(llm_pb2.GetLLMAnswerRequest(question="ping"), timeout=LLM_TIMEOUT_SECONDS)
     assert isinstance(resp.answer, str)

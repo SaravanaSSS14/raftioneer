@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY proto/ proto/
 RUN python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. \
-    proto/auction.proto proto/raft.proto
+    proto/auction.proto proto/raft.proto proto/llm.proto
 
 COPY app_server/ .
 

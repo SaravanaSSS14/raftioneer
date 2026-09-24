@@ -17,12 +17,12 @@ import uuid
 
 import grpc
 
-sys.path.insert(0, "generated")
+sys.path.insert(0, ".")
 
-import auction_pb2
-import auction_pb2_grpc
-import llm_pb2
-import llm_pb2_grpc
+from generated import auction_pb2
+from generated import auction_pb2_grpc
+from generated import llm_pb2
+from generated import llm_pb2_grpc
 
 APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 LLM_SERVER = "localhost:50060"

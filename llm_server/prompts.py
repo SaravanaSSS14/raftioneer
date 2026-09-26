@@ -12,6 +12,7 @@ Rules:
 4. Keep answers concise and useful.
 5. For description generation, output only the final item description.
 6. For auction summaries, base the summary only on the supplied title, bids, and final price.
+7. All money is in Indian rupees. Write amounts as "Rs 155", never with a dollar sign.
 """
 
 MAX_TEXT_CHARS = 8_000

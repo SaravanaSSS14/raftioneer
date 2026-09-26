@@ -1,7 +1,11 @@
 import sqlite3
 import os
+import uuid
+import logging
 from typing import Optional
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "auctions.db")
@@ -82,7 +86,32 @@ def init_database():
                 seller_id TEXT NOT NULL
             )
         """)
-        
+
+        # Mock escrow settlement, one row per closed auction. No money moves:
+        # this records what a real payment step would hold and why.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlements (
+                auction_id TEXT PRIMARY KEY,
+                winner_id TEXT,
+                seller_id TEXT NOT NULL,
+                final_price REAL NOT NULL,
+                buyers_premium REAL NOT NULL,
+                escrow_status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        # The recap written after an auction closes (by the LLM node, or a
+        # templated fallback if it was unreachable).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auction_summaries (
+                auction_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                from_fallback INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
         conn.commit()
         print(f"[DB] Database initialized at {DB_PATH}")
         
@@ -117,27 +146,6 @@ def create_user(username: str, user_id: str, password_hash: str) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
-    finally:
-        conn.close()
-
-
-def create_session(username: str, session_token: str, user_id: str,
-                   expires_in_minutes: int = 60) -> Optional[str]:
-    """Create a new session and return the token if successful."""
-    conn = get_connection()
-    try:
-        now_ms = datetime.now().timestamp() * 1000
-        expires_at_ms = now_ms + (expires_in_minutes * 60 * 1000)
-        
-        conn.execute("""
-            INSERT INTO sessions (session_token, user_id, username, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (session_token, user_id, username, now_ms, expires_at_ms))
-        
-        conn.commit()
-        return session_token
-    except sqlite3.IntegrityError:
-        return None
     finally:
         conn.close()
 
@@ -277,7 +285,6 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
         if amount < auction.get("reserve_price", 0):
             return False, f"Bid does not meet reserve price ({auction['reserve_price']})"
         
-        import uuid
         bid_id = str(uuid.uuid4())[:8]
         
         conn.execute("""
@@ -294,8 +301,9 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
         conn.commit()
         return True, bid_id
         
-    except sqlite3.Error as e:
-        return False, str(e)
+    except sqlite3.Error:
+        log.exception("create_bid failed for auction %s", auction_id)
+        return False, "Could not record bid, please try again"
     finally:
         conn.close()
 
@@ -335,28 +343,93 @@ def close_expired_auctions(now_ms: int) -> list[dict]:
 
 
 def get_bids_for_auction(auction_id: str) -> list[dict]:
-    """Get all bids for an auction."""
+    """All bids on an auction, oldest first, with the bidder's username.
+
+    Joins users (a permanent identity), not sessions: a session row goes
+    away on logout, and an INNER JOIN on it would silently drop that
+    person's bids from the history.
+    """
     conn = get_connection()
     try:
         result = conn.execute("""
-            SELECT b.*, s.username as bidder_name
+            SELECT b.*, u.username AS bidder_name
             FROM bids b
-            JOIN sessions s ON b.bidder_id = s.user_id
+            LEFT JOIN users u ON b.bidder_id = u.user_id
             WHERE b.auction_id = ?
-            ORDER BY b.timestamp_ms DESC
+            ORDER BY b.timestamp_ms ASC, b.rowid ASC
         """, (auction_id,)).fetchall()
-        
+
         return [dict(b) for b in result]
     finally:
         conn.close()
 
 
-def get_user_by_username(username: str) -> Optional[str]:
-    """Get user ID by username."""
+def get_closed_unsettled() -> list[dict]:
+    """Closed auctions that have no settlement yet.
+
+    An auction can close two ways - the background timer, or a late bid
+    arriving after its deadline (create_bid's reactive path). Settling
+    everything that is CLOSED-and-unsettled, rather than only what the
+    timer itself just closed, covers both (and survives a restart).
+    """
     conn = get_connection()
     try:
-        result = conn.execute("""SELECT user_id FROM sessions WHERE username = ? LIMIT 1""", (username,)).fetchone()
-        
-        return result["user_id"] if result else None
+        rows = conn.execute("""
+            SELECT a.*, i.title, i.description, i.seller_id
+            FROM auctions a
+            JOIN items i ON a.item_id = i.item_id
+            LEFT JOIN settlements s ON s.auction_id = a.auction_id
+            WHERE a.status = 'CLOSED' AND s.auction_id IS NULL
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def create_settlement(auction_id: str, winner_id: Optional[str], seller_id: str,
+                      final_price: float, buyers_premium: float, escrow_status: str) -> bool:
+    """Record the mock escrow settlement for a closed auction. Idempotent:
+    returns False (and changes nothing) if one already exists."""
+    conn = get_connection()
+    try:
+        now_ms = datetime.now().timestamp() * 1000
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO settlements
+            (auction_id, winner_id, seller_id, final_price, buyers_premium, escrow_status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (auction_id, winner_id, seller_id, final_price, buyers_premium, escrow_status, now_ms))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def get_settlement(auction_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM settlements WHERE auction_id = ?", (auction_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def save_summary(auction_id: str, summary: str, from_fallback: bool) -> None:
+    conn = get_connection()
+    try:
+        now_ms = datetime.now().timestamp() * 1000
+        conn.execute("""
+            INSERT OR REPLACE INTO auction_summaries (auction_id, summary, from_fallback, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (auction_id, summary, 1 if from_fallback else 0, now_ms))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_summary(auction_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM auction_summaries WHERE auction_id = ?", (auction_id,)).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()

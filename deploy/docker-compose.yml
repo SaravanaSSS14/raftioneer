@@ -1,4 +1,31 @@
 services:
+  # ---- Node 1: the LLM node -------------------------------------------
+  # llm_server is the gRPC face (independent of the auction cluster, holds
+  # no auction state). Ollama is its model backend, run as a sibling
+  # service so `docker compose up` is fully self-contained: nothing needs
+  # to be installed on the host. The model is downloaded once into a
+  # named volume; later runs start immediately.
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
+  ollama_pull:
+    image: ollama/ollama:latest
+    entrypoint: ["ollama", "pull", "qwen2.5:1.5b"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   llm_server:
     build:
       context: ..
@@ -6,9 +33,19 @@ services:
     environment:
       - NODE_ID=llm-server
       - PORT=50060
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen2.5:1.5b
+      - OLLAMA_TIMEOUT_SECONDS=90
+    depends_on:
+      ollama_pull:
+        condition: service_completed_successfully
     ports:
       - "50060:50060"
 
+  # ---- Nodes 2-4: application servers ----------------------------------
+  # The app servers deliberately do NOT depend on the LLM node: bidding
+  # must work even if the AI layer is slow, still downloading its model,
+  # or down. LLM features degrade to a plain-text fallback instead.
   app_server_1:
     build:
       context: ..
@@ -17,6 +54,7 @@ services:
       - NODE_ID=app-server-1
       - PORT=50051
       - PEERS=app_server_2:50051,app_server_3:50051
+      - LLM_SERVER=llm_server:50060
     ports:
       - "50051:50051"
 
@@ -28,6 +66,7 @@ services:
       - NODE_ID=app-server-2
       - PORT=50051
       - PEERS=app_server_1:50051,app_server_3:50051
+      - LLM_SERVER=llm_server:50060
     ports:
       - "50052:50051"
 
@@ -39,9 +78,11 @@ services:
       - NODE_ID=app-server-3
       - PORT=50051
       - PEERS=app_server_1:50051,app_server_2:50051
+      - LLM_SERVER=llm_server:50060
     ports:
       - "50053:50051"
 
+  # ---- Node 5: simulated bidders ---------------------------------------
   client:
     build:
       context: ..
@@ -53,3 +94,6 @@ services:
       - app_server_1
       - app_server_2
       - app_server_3
+
+volumes:
+  ollama_models:

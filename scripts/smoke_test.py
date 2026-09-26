@@ -25,6 +25,9 @@ import llm_pb2_grpc
 APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 LLM_SERVER = "localhost:50060"
 TIMEOUT_SECONDS = 3
+# The very first LLM call after a fresh boot loads the model into memory
+# (several seconds on CPU), so the LLM node gets a far longer deadline.
+LLM_TIMEOUT_SECONDS = 90
 
 
 def check_app_server(address: str) -> bool:
@@ -88,7 +91,7 @@ def check_llm_server(address: str) -> bool:
     try:
         with grpc.insecure_channel(address) as channel:
             stub = llm_pb2_grpc.LLMServiceStub(channel)
-            stub.GetLLMAnswer(llm_pb2.GetLLMAnswerRequest(question="ping"), timeout=TIMEOUT_SECONDS)
+            stub.GetLLMAnswer(llm_pb2.GetLLMAnswerRequest(question="ping"), timeout=LLM_TIMEOUT_SECONDS)
         print(f"OK   {address}  (LLMService.GetLLMAnswer responded)")
         return True
     except grpc.RpcError as exc:

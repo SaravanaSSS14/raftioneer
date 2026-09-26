@@ -8,31 +8,30 @@ import sys
 from pathlib import Path
 
 import grpc
-from generated import llm_pb2
-from generated import llm_pb2_grpc
 
+# Locally, generated protobuf modules live in repo_root/generated/.
+# In Docker, grpc_tools writes llm_pb2.py flat into /app, which is
+# already on sys.path - so the stubs are always imported by bare name.
+_GENERATED_DIR = Path(__file__).resolve().parents[1] / "generated"
 
-from .ollama_client import (
+if _GENERATED_DIR.is_dir() and str(_GENERATED_DIR) not in sys.path:
+    sys.path.insert(0, str(_GENERATED_DIR))
+
+import llm_pb2  # noqa: E402
+import llm_pb2_grpc  # noqa: E402
+
+from .ollama_client import (  # noqa: E402
     OllamaClient,
     OllamaClientError,
     OllamaConfig,
 )
 
-from .prompts import (
+from .prompts import (  # noqa: E402
     SYSTEM_PROMPT,
     build_answer_prompt,
     build_description_prompt,
     build_summary_prompt,
 )
-
-
-
-# Locally, generated protobuf modules live in repo_root/generated/.
-# In Docker, grpc_tools generates llm_pb2.py directly into /app.
-_GENERATED_DIR = Path(__file__).resolve().parents[1] / "generated"
-
-if _GENERATED_DIR.is_dir() and str(_GENERATED_DIR) not in sys.path:
-    sys.path.insert(0, str(_GENERATED_DIR))
 
 
 

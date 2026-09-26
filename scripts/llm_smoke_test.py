@@ -13,10 +13,8 @@ sys.path.insert(
 )
 
 
-from generated import llm_pb2
-from generated import llm_pb2_grpc
-
-
+import llm_pb2
+import llm_pb2_grpc
 LLM_SERVER = os.environ.get(
     "TEST_LLM_SERVER",
     "localhost:50060",

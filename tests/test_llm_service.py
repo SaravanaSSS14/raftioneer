@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio
-from generated import llm_pb2
-
+import llm_pb2
 from llm_server.main import (
     LLMServiceServicer,
 )

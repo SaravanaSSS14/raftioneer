@@ -2,10 +2,12 @@
 (`docker compose up`, or services started locally on matching ports).
 
 Deliberately generic, same spirit as scripts/smoke_test.py: these check
-invariants that must hold no matter how Member B implements business
-logic internally (bid validation, session handling, etc.) — never
-specific seed users, item names, or auction ids, since those are his
-implementation details, not part of the frozen .proto contract.
+invariants that must hold no matter how business logic is implemented
+internally (bid validation, session handling, etc.) — never specific seed
+users, item names, or auction ids, since those are implementation details,
+not part of the .proto contract. The LLM-backed tests pass whether the LLM
+node answers or the app server falls back to plain text: the contract is
+that the feature always responds, and bidding never depends on the LLM.
 
 Run with the stack already up:
     source venv/bin/activate
@@ -13,16 +15,16 @@ Run with the stack already up:
     pytest tests/
 """
 import os
+import time
 import uuid
 
 import grpc
 import pytest
 
-from generated import auction_pb2
-from generated import auction_pb2_grpc
-from generated import llm_pb2
-from generated import llm_pb2_grpc
-
+import auction_pb2
+import auction_pb2_grpc
+import llm_pb2
+import llm_pb2_grpc
 APP_SERVERS = os.environ.get(
     "TEST_APP_SERVERS", "localhost:50051,localhost:50052,localhost:50053"
 ).split(",")
@@ -77,3 +79,136 @@ def test_logout_does_not_error(app_stub):
 def test_llm_get_answer_responds(llm_stub):
     resp = llm_stub.GetLLMAnswer(llm_pb2.GetLLMAnswerRequest(question="ping"), timeout=LLM_TIMEOUT_SECONDS)
     assert isinstance(resp.answer, str)
+
+
+# ---- Assistant, settlement and recap ----
+
+
+def _login(stub, username):
+    resp = stub.Login(
+        auction_pb2.LoginRequest(username=username, password="pytest-pw-123"),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert resp.success, resp.error_message
+    return resp
+
+
+def _wait_for_recap(stub, auction_id, timeout_seconds=120):
+    """Poll until the auction is closed AND its recap has been written."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        resp = stub.GetAuctionSummary(
+            auction_pb2.GetAuctionSummaryRequest(auction_id=auction_id), timeout=APP_TIMEOUT_SECONDS
+        )
+        if resp.closed and resp.summary_ready:
+            return resp
+        time.sleep(0.5)
+    pytest.fail(f"auction {auction_id} was not closed and summarised within {timeout_seconds}s")
+
+
+@pytest.fixture
+def single_stub():
+    """One replica only: these tests create real auctions and wait for them."""
+    with grpc.insecure_channel(APP_SERVERS[0]) as channel:
+        yield auction_pb2_grpc.AuctionServiceStub(channel)
+
+
+def test_ask_assistant_without_valid_session_is_refused(app_stub):
+    resp = app_stub.AskAssistant(
+        auction_pb2.AskAssistantRequest(session_token="", question="Is this any good?"),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert not resp.success
+    assert not resp.answer
+
+
+def test_get_auction_summary_for_unknown_id_is_not_found(app_stub):
+    resp = app_stub.GetAuctionSummary(
+        auction_pb2.GetAuctionSummaryRequest(auction_id=f"pytest-{uuid.uuid4()}"),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert not resp.found
+
+
+def test_ask_assistant_always_answers(app_stub):
+    """Answered by the LLM node or, if it is slow/down, by the plain-text
+    fallback - either way the caller gets a non-empty answer."""
+    token = _login(app_stub, "pytest-asker").session_token
+    resp = app_stub.AskAssistant(
+        auction_pb2.AskAssistantRequest(session_token=token, question="How does the buyer's premium work?"),
+        timeout=LLM_TIMEOUT_SECONDS,
+    )
+    assert resp.success, resp.error_message
+    assert resp.answer.strip()
+
+
+def test_ask_assistant_about_unknown_auction_is_refused(app_stub):
+    token = _login(app_stub, "pytest-asker").session_token
+    resp = app_stub.AskAssistant(
+        auction_pb2.AskAssistantRequest(
+            session_token=token, auction_id=f"pytest-{uuid.uuid4()}", question="Any bids yet?"
+        ),
+        timeout=LLM_TIMEOUT_SECONDS,
+    )
+    assert not resp.success
+
+
+def test_open_auction_has_no_settlement_yet(single_stub):
+    seller = _login(single_stub, "pytest-seller").session_token
+    created = single_stub.CreateAuction(
+        auction_pb2.CreateAuctionRequest(
+            session_token=seller, title="pytest open auction", description="d", duration_seconds=600
+        ),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    resp = single_stub.GetAuctionSummary(
+        auction_pb2.GetAuctionSummaryRequest(auction_id=created.auction_id), timeout=APP_TIMEOUT_SECONDS
+    )
+    assert resp.found and not resp.closed
+
+
+def test_closed_auction_reports_winner_settlement_and_recap(single_stub):
+    seller = _login(single_stub, "pytest-seller").session_token
+    low = _login(single_stub, "pytest-bidder-low")
+    high = _login(single_stub, "pytest-bidder-high")
+
+    created = single_stub.CreateAuction(
+        auction_pb2.CreateAuctionRequest(
+            session_token=seller, title="pytest closing auction", description="d", duration_seconds=3
+        ),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert created.success, created.error_message
+
+    for bidder, amount in [(low, 40.0), (high, 55.0)]:
+        bid = single_stub.PlaceBid(
+            auction_pb2.PlaceBidRequest(
+                session_token=bidder.session_token, auction_id=created.auction_id, amount=amount
+            ),
+            timeout=APP_TIMEOUT_SECONDS,
+        )
+        assert bid.accepted, bid.error_message
+
+    result = _wait_for_recap(single_stub, created.auction_id)
+
+    assert result.winner_id == high.user_id
+    assert result.final_price == 55.0
+    assert 0 < result.buyers_premium < result.final_price
+    assert result.escrow_status.startswith("HELD")
+    assert result.summary.strip()
+
+
+def test_closed_auction_with_no_bids_is_a_no_sale(single_stub):
+    seller = _login(single_stub, "pytest-seller").session_token
+    created = single_stub.CreateAuction(
+        auction_pb2.CreateAuctionRequest(
+            session_token=seller, title="pytest unloved auction", description="d", duration_seconds=1
+        ),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    result = _wait_for_recap(single_stub, created.auction_id)
+
+    assert result.winner_id == ""
+    assert result.final_price == 0.0
+    assert result.buyers_premium == 0.0
+    assert result.escrow_status == "NO_SALE"

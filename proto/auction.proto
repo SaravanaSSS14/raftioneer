@@ -102,6 +102,41 @@ message CreateAuctionResponse {
   string auction_id = 3;
 }
 
+// ---- Assistant & post-auction results ----
+// Added post-freeze, same category as CreateAuction: purely additive (old
+// clients simply don't know these RPCs exist). The LLM node is only useful
+// if a client can reach it through the app servers, and a closed auction
+// needs somewhere for its outcome (winner, settlement, recap) to be read.
+
+message AskAssistantRequest {
+  string session_token = 1;
+  string auction_id = 2; // optional; when set, that auction's details are injected as context
+  string question = 3;
+}
+
+message AskAssistantResponse {
+  bool success = 1;
+  string answer = 2;
+  bool from_fallback = 3; // true if the LLM node was unavailable and a plain-text answer was returned instead
+  string error_message = 4;
+}
+
+message GetAuctionSummaryRequest {
+  string auction_id = 1;
+}
+
+message GetAuctionSummaryResponse {
+  bool found = 1;
+  bool closed = 2;
+  string winner_id = 3;        // "" if the auction closed with no bids
+  double final_price = 4;
+  double buyers_premium = 5;   // mock commission on top of the final price
+  string escrow_status = 6;    // mock settlement, e.g. "HELD (mock)" or "NO_SALE"
+  string summary = 7;          // recap in the assistant's voice, or a plain templated one
+  bool summary_from_fallback = 8;
+  bool summary_ready = 9;      // false while the recap is still being written
+}
+
 // ---- Bid placement ----
 
 message PlaceBidRequest {
@@ -128,4 +163,9 @@ service AuctionService {
   // Accepted only by the current Raft leader; followers respond with
   // accepted=false and leader_hint set (see CLAUDE.md, Architecture).
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
+  // Bidder FAQ, answered by the LLM node with the auction's details injected
+  // as context. Never blocks or affects bidding; falls back to plain text.
+  rpc AskAssistant(AskAssistantRequest) returns (AskAssistantResponse);
+  // Outcome of a closed auction: winner, mock escrow settlement, recap.
+  rpc GetAuctionSummary(GetAuctionSummaryRequest) returns (GetAuctionSummaryResponse);
 }

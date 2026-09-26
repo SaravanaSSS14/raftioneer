@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """Seeds the running stack with real, specific demo data instead of an
-empty system. Per Raftioneer_Checkpoint.pdf: nothing in the running
-system creates an auction on its own - CreateAuction exists but
-nothing calls it automatically. This is that one-off call, made real.
+empty system: nothing creates an auction on its own - CreateAuction
+exists, but nothing calls it automatically. This is that one-off call.
 
-Uses only the frozen, already-implemented AuctionService contract
-(Login auto-registers a seller on first use, then CreateAuction) -
-no new RPCs, no schema changes, nothing beyond what Member B's
-business logic already does.
+Uses only the AuctionService contract (Login auto-registers a seller on
+first use, then CreateAuction) - no new RPCs, no schema changes.
 
-Each app-server replica has its own separate SQLite file (no Raft
-replication yet on main), so this seeds every replica in APP_SERVERS
-identically - otherwise only whichever one replica you happened to
-call would ever show these auctions in ListAuctions.
+Each app-server replica has its own separate SQLite file (replication
+between replicas is Milestone 2), so this seeds every replica in
+APP_SERVERS identically - otherwise only whichever replica you happened
+to call would ever show these auctions in ListAuctions.
 
 Usage (with the stack already up):
     source venv/bin/activate

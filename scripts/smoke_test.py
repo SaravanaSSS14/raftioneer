@@ -2,10 +2,9 @@
 """Manual smoke test against a running `docker compose up` stack.
 
 Deliberately generic: it checks contract-level invariants that must
-hold no matter how business logic (owned by Member B) is implemented
-internally — it does NOT assume specific seed users, item names, or
-auction ids, since those are his implementation details, not part of
-the frozen .proto contract.
+hold no matter how business logic is implemented internally — it
+does NOT assume specific seed users, item names, or auction ids, since
+those are implementation details, not part of the .proto contract.
 
 Usage (with the stack already up):
     source venv/bin/activate
@@ -17,13 +16,12 @@ import uuid
 
 import grpc
 
-sys.path.insert(0, ".")
+sys.path.insert(0, "generated")
 
-from generated import auction_pb2
-from generated import auction_pb2_grpc
-from generated import llm_pb2
-from generated import llm_pb2_grpc
-
+import auction_pb2
+import auction_pb2_grpc
+import llm_pb2
+import llm_pb2_grpc
 APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 LLM_SERVER = "localhost:50060"
 TIMEOUT_SECONDS = 3
@@ -61,10 +59,25 @@ def check_app_server(address: str) -> bool:
             )
             assert not bid.accepted, "PlaceBid accepted a bid with an empty session_token"
 
+            # The assistant is session-gated like bidding, and an unknown
+            # auction never has a summary.
+            asked = stub.AskAssistant(
+                auction_pb2.AskAssistantRequest(session_token="", question="hello?"),
+                timeout=TIMEOUT_SECONDS,
+            )
+            assert not asked.success, "AskAssistant answered a request with an empty session_token"
+            summary = stub.GetAuctionSummary(
+                auction_pb2.GetAuctionSummaryRequest(auction_id=bogus_id), timeout=TIMEOUT_SECONDS
+            )
+            assert not summary.found, f"GetAuctionSummary reported found=True for a made-up id ({bogus_id})"
+
             # Logout must not error, valid session or not.
             stub.Logout(auction_pb2.LogoutRequest(session_token=""), timeout=TIMEOUT_SECONDS)
 
-        print(f"OK   {address}  (Login, ListAuctions, GetAuction, PlaceBid, Logout all well-formed)")
+        print(
+            f"OK   {address}  (Login, ListAuctions, GetAuction, PlaceBid, "
+            "AskAssistant, GetAuctionSummary, Logout all well-formed)"
+        )
         return True
     except (grpc.RpcError, AssertionError) as exc:
         print(f"FAIL {address}  ({exc})")

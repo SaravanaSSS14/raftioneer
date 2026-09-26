@@ -12,11 +12,20 @@ NODE_ID = os.environ.get("NODE_ID", "client")
 APP_SERVERS = [s for s in os.environ.get("APP_SERVERS", "").split(",") if s]
 CYCLE_INTERVAL_SECONDS = 5
 
-# Demo bidder credentials. Business logic (including what accounts
-# exist) is owned by Member B — override via env vars if the seeded
-# demo accounts end up named differently once his login logic lands.
-BIDDER_USERNAME = os.environ.get("BIDDER_USERNAME", "alice")
-BIDDER_PASSWORD = os.environ.get("BIDDER_PASSWORD", "alice123")
+# A pool of named bidders instead of one identity pinging every
+# server — makes a bidding war on scripts/seed_demo_data.py's campus
+# clearance items look like several real people competing, not one
+# account testing itself against 3 replicas. Login auto-registers on
+# first use (same account for the whole demo run after that). Override
+# BIDDER_USERNAME/BIDDER_PASSWORD to pin a single account instead.
+BIDDER_PERSONAS = [
+    ("deepika_hostel3", "deepika123"),
+    ("karan_hostel5", "karan123"),
+    ("ananya_ug1", "ananya123"),
+    ("farhan_hostel8", "farhan123"),
+]
+if os.environ.get("BIDDER_USERNAME"):
+    BIDDER_PERSONAS = [(os.environ["BIDDER_USERNAME"], os.environ.get("BIDDER_PASSWORD", ""))]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,18 +40,19 @@ async def run_bidder_cycle(address: str) -> None:
     not today's stub responses — every step just logs how far it got,
     so this same code keeps working (and does more) as real business
     logic lands, with no changes needed here."""
+    username, password = random.choice(BIDDER_PERSONAS)
     try:
         async with grpc.aio.insecure_channel(address) as channel:
             stub = auction_pb2_grpc.AuctionServiceStub(channel)
 
             login_resp = await stub.Login(
-                auction_pb2.LoginRequest(username=BIDDER_USERNAME, password=BIDDER_PASSWORD),
+                auction_pb2.LoginRequest(username=username, password=password),
                 timeout=3,
             )
             if not login_resp.success:
-                log.info("%s: login failed (%s)", address, login_resp.error_message or "no reason given")
+                log.info("%s: login failed for %s (%s)", address, username, login_resp.error_message or "no reason given")
                 return
-            log.info("%s: logged in as %s", address, BIDDER_USERNAME)
+            log.info("%s: logged in as %s", address, username)
 
             list_resp = await stub.ListAuctions(
                 auction_pb2.ListAuctionsRequest(status_filter=auction_pb2.ACTIVE),
@@ -53,7 +63,11 @@ async def run_bidder_cycle(address: str) -> None:
                 return
 
             auction = random.choice(list_resp.auctions)
-            bid_amount = auction.current_highest_bid + round(random.uniform(1, 10), 2)
+            # A real bidder checks the reserve, not just the current
+            # highest bid — otherwise every early bid on a seeded item
+            # with a reserve_price would bid too low to ever succeed.
+            floor = max(auction.current_highest_bid, auction.reserve_price)
+            bid_amount = floor + round(random.uniform(1, 10), 2)
 
             bid_resp = await stub.PlaceBid(
                 auction_pb2.PlaceBidRequest(
@@ -65,11 +79,11 @@ async def run_bidder_cycle(address: str) -> None:
             )
             if bid_resp.accepted:
                 log.info(
-                    "%s: bid %.2f accepted on auction=%s (item=%s)",
-                    address, bid_amount, auction.auction_id, auction.item.title,
+                    "%s: %s bid %.2f, accepted on auction=%s (item=%s)",
+                    address, username, bid_amount, auction.auction_id, auction.item.title,
                 )
             else:
-                log.info("%s: bid rejected (%s)", address, bid_resp.error_message or "no reason given")
+                log.info("%s: %s's bid rejected (%s)", address, username, bid_resp.error_message or "no reason given")
 
     except grpc.aio.AioRpcError as exc:
         log.warning("%s: unreachable (%s)", address, exc.code())

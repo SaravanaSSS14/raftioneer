@@ -39,6 +39,19 @@ Brings up 5 nodes: the LLM server, three app-server replicas
 App servers are published on the host at `localhost:50051/50052/50053`,
 the LLM server at `localhost:50060`.
 
+The stack starts empty — nothing creates an auction automatically. Seed
+it with a real theme (a campus clearance auction: hostel move-out
+items, textbooks, a guitar) instead of testing against nothing:
+
+```bash
+python scripts/seed_demo_data.py   # creates the same items on all 3 replicas
+```
+
+`client/main.py` then bids against them as one of a handful of named
+personas, so `docker compose logs client` reads like several people
+actually competing for a cycle or a guitar, not one test account
+pinging itself.
+
 ## Testing
 
 With the stack up (Compose, or services run locally on matching ports):

@@ -28,6 +28,11 @@ message SummarizeAuctionRequest {
   string item_title = 2;
   repeated double bid_history = 3;
   double final_price = 4;
+  // Average final price across other closed, sold auctions (this one
+  // excluded), if any exist yet. `optional` so 0.0 and "not available"
+  // are distinguishable - the app server never fabricates a trend from
+  // zero prior sales.
+  optional double average_sale_price = 5;
 }
 
 message SummarizeAuctionResponse {

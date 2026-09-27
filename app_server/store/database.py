@@ -413,6 +413,23 @@ def get_settlement(auction_id: str) -> Optional[dict]:
         conn.close()
 
 
+def get_average_sale_price(exclude_auction_id: str) -> Optional[float]:
+    """Average final_price across other settlements that actually sold
+    (winner_id set - a NO_SALE settlement has none), this auction excluded
+    so a sale is never averaged against itself. None if there are no
+    other sales yet - the caller must not fabricate a trend from zero data.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT AVG(final_price) AS avg_price FROM settlements
+            WHERE winner_id IS NOT NULL AND auction_id != ?
+        """, (exclude_auction_id,)).fetchone()
+        return float(row["avg_price"]) if row and row["avg_price"] is not None else None
+    finally:
+        conn.close()
+
+
 def save_summary(auction_id: str, summary: str, from_fallback: bool) -> None:
     conn = get_connection()
     try:

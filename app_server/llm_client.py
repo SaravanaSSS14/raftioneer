@@ -56,14 +56,19 @@ class LLMClient:
         item_title: str,
         bid_history: list[float],
         final_price: float,
+        average_sale_price: float | None = None,
     ) -> str:
+        request = llm_pb2.SummarizeAuctionRequest(
+            auction_id=auction_id,
+            item_title=item_title,
+            bid_history=bid_history,
+            final_price=final_price,
+        )
+        if average_sale_price is not None:
+            request.average_sale_price = average_sale_price
+
         response = await self._stub.SummarizeAuction(
-            llm_pb2.SummarizeAuctionRequest(
-                auction_id=auction_id,
-                item_title=item_title,
-                bid_history=bid_history,
-                final_price=final_price,
-            ),
+            request,
             timeout=self._timeout_seconds,
         )
 

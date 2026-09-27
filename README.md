@@ -42,7 +42,7 @@ app_server/     # auction node: auth, bidding, timer, escrow stub, assistant glu
 llm_server/     # LLM node: gRPC service, Ollama client, prompts
 client/         # bidder simulation (named personas)
 deploy/         # docker-compose.yml
-scripts/        # seed data, sample queries, stress test, smoke tests
+scripts/        # seed data, sample queries, board, stress test, smoke tests
 tests/          # pytest: contract tests (live stack) + unit tests
 generated/      # gRPC stubs generated from proto/ — gitignored, not committed
 ```
@@ -95,6 +95,22 @@ description** (the LLM writes it), places bids (including one that must be
 rejected), waits for the auction to close, and prints the winner, settlement
 and recap. Add `--server localhost:50052` to target another replica.
 
+Once an auction has actually sold, later recaps mention how the sale compares
+to the running average price (`"in line with"` / `"12% above"` / `"8% below"`
+the average of other closed auctions) — computed once in Python and handed to
+the LLM as a fact to relay, not raw numbers to do its own arithmetic on.
+
+### The auction board
+
+```bash
+python scripts/board.py                                          # every active auction, all 3 replicas
+python scripts/board.py --servers localhost:50051,localhost:50052
+```
+
+One `ListAuctions` call per replica (no new RPC), printed as a single table —
+item, highest bid, reserve, time left — soonest-closing first. Meant to be run
+once mid-demo instead of narrating over scrolling `client` logs.
+
 ### Concurrency stress test
 
 ```bash
@@ -117,7 +133,7 @@ the highest bid the server accepted (no lost or overwritten bids).
 | Mock escrow settlement + 5% buyer's premium | `settle_auction`, `app_server/assistant.py` |
 | Bidder FAQ assistant ("Tapri"), with the auction's details as context | `AskAssistant` |
 | Blank description → LLM writes the listing | `CreateAuction` |
-| Post-auction recap (LLM, or a templated one) | `GetAuctionSummary` |
+| Post-auction recap, incl. a pricing trend vs. other closed auctions | `GetAuctionSummary` |
 
 `AskAssistant` and `GetAuctionSummary` are additions to the original contract,
 alongside `CreateAuction`; all are purely additive (existing clients are

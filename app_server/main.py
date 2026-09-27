@@ -446,18 +446,21 @@ async def summarize_auction(llm: LLMClient | None, record: dict, settlement: dic
     auction_id = record["auction_id"]
     try:
         amounts = [float(b["amount"]) for b in database.get_bids_for_auction(auction_id)]
+        average_price = database.get_average_sale_price(exclude_auction_id=auction_id)
         text, from_fallback = None, True
 
         if llm is not None:
             try:
-                text = await llm.summarize_auction(auction_id, record["title"], amounts, settlement["final_price"])
+                text = await llm.summarize_auction(
+                    auction_id, record["title"], amounts, settlement["final_price"], average_price
+                )
                 from_fallback = False
             except grpc.aio.AioRpcError as exc:
                 log.warning("LLM node unavailable for the recap of %s (%s) - using template", auction_id, exc.code())
 
         if text is None:
             winner = settlement["winner_id"].removeprefix("user_") if settlement["winner_id"] else None
-            text = assistant.fallback_summary(record["title"], amounts, settlement["final_price"], winner)
+            text = assistant.fallback_summary(record["title"], amounts, settlement["final_price"], winner, average_price)
 
         database.save_summary(auction_id, text, from_fallback)
         log.info("recap auction=%s (%s): %s", auction_id, "template" if from_fallback else "LLM", text)

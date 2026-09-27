@@ -77,6 +77,44 @@ def test_fallback_summary_for_a_sale():
     assert "Winner: priya" in text
 
 
+def test_describe_trend_is_empty_with_no_prior_average():
+    assert assistant.describe_trend(100.0, None) == ""
+    assert assistant.describe_trend(100.0, 0.0) == ""
+
+
+def test_describe_trend_above_average():
+    text = assistant.describe_trend(150.0, 100.0)
+    assert "50% above" in text
+    assert "Rs 100.00 average sale price" in text
+
+
+def test_describe_trend_below_average():
+    text = assistant.describe_trend(60.0, 100.0)
+    assert "40% below" in text
+
+
+def test_describe_trend_close_to_average_reads_as_in_line():
+    text = assistant.describe_trend(103.0, 100.0)
+    assert "in line with" in text
+    assert "%" not in text
+
+
+def test_fallback_summary_includes_trend_when_average_given():
+    text = assistant.fallback_summary("Table fan", [50.0, 60.0, 75.0], 150.0, "priya", average_sale_price=100.0)
+    assert "50% above the Rs 100.00 average sale price so far" in text
+
+
+def test_fallback_summary_omits_trend_without_an_average():
+    text = assistant.fallback_summary("Table fan", [50.0, 60.0, 75.0], 75.0, "priya", average_sale_price=None)
+    assert "average sale price" not in text
+
+
+def test_fallback_summary_with_no_bids_never_mentions_trend():
+    # No sale happened at all - a trend clause here would be nonsensical.
+    text = assistant.fallback_summary("Table fan", [], 0.0, None, average_sale_price=100.0)
+    assert text == "Table fan closed with no bids."
+
+
 def test_fallback_summary_uses_singular_for_one_bid():
     assert "1 bid," in assistant.fallback_summary("Table fan", [50.0], 50.0, "priya")
 

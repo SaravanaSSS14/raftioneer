@@ -208,11 +208,21 @@ class LLMServiceServicer(
                 "final_price must be a finite non-negative value",
             )
 
+        average_sale_price = None
+        if request.HasField("average_sale_price"):
+            if not math.isfinite(request.average_sale_price) or request.average_sale_price < 0:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "average_sale_price must be a finite non-negative value",
+                )
+            average_sale_price = request.average_sale_price
+
         prompt = build_summary_prompt(
             auction_id=auction_id,
             item_title=item_title,
             bid_history=bid_history,
             final_price=request.final_price,
+            average_sale_price=average_sale_price,
         )
 
         summary = await self._generate(

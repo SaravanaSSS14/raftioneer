@@ -75,10 +75,31 @@ def compute_settlement(final_price: float, has_winner: bool) -> tuple[float, str
     return round(final_price * BUYERS_PREMIUM_PERCENT / 100.0, 2), ESCROW_HELD
 
 
-def fallback_summary(title: str, bid_amounts: list[float], final_price: float, winner_name: Optional[str]) -> str:
+def describe_trend(final_price: float, average_sale_price: Optional[float]) -> str:
+    """One short clause comparing a sale to the running average, or "" if
+    there's no prior average to compare against yet. Deterministic - this
+    is what the fallback path uses instead of asking the LLM to judge it.
+    """
+    if average_sale_price is None or average_sale_price <= 0:
+        return ""
+    diff_pct = (final_price - average_sale_price) / average_sale_price * 100
+    if abs(diff_pct) < 5:
+        return f" That's in line with the {money(average_sale_price)} average sale price so far."
+    direction = "above" if diff_pct > 0 else "below"
+    return f" That's {abs(diff_pct):.0f}% {direction} the {money(average_sale_price)} average sale price so far."
+
+
+def fallback_summary(
+    title: str,
+    bid_amounts: list[float],
+    final_price: float,
+    winner_name: Optional[str],
+    average_sale_price: Optional[float] = None,
+) -> str:
     if not bid_amounts:
         return f"{title} closed with no bids."
     n = len(bid_amounts)
     bids = "1 bid" if n == 1 else f"{n} bids"
     winner = f" Winner: {winner_name}." if winner_name else ""
-    return f"{title} sold for {money(final_price)} after {bids}, opening at {money(bid_amounts[0])}.{winner}"
+    trend = describe_trend(final_price, average_sale_price)
+    return f"{title} sold for {money(final_price)} after {bids}, opening at {money(bid_amounts[0])}.{winner}{trend}"

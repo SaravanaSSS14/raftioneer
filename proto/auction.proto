@@ -5,7 +5,7 @@ package raftioneer.auction;
 // DRAFT — client-facing contract between the app-server (Member A) and
 // business-logic layer (Member B). Frozen once both members sign off;
 // after that, method signature changes require a heads-up before either
-// side implements against them (see CLAUDE.md conventions).
+// side implements against them (see README.md conventions).
 
 // ---- Domain messages ----
 
@@ -161,7 +161,7 @@ service AuctionService {
   rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
   rpc CreateAuction(CreateAuctionRequest) returns (CreateAuctionResponse);
   // Accepted only by the current Raft leader; followers respond with
-  // accepted=false and leader_hint set (see CLAUDE.md, Architecture).
+  // accepted=false and leader_hint set (see README.md, Architecture).
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
   // Bidder FAQ, answered by the LLM node with the auction's details injected
   // as context. Never blocks or affects bidding; falls back to plain text.

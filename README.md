@@ -180,5 +180,5 @@ and `tests/test_llm_service.py` are unit tests that need no running stack.
 
 Milestone 1 is functionally complete: every RPC works, the LLM node runs in
 its own container and is wired into the app servers with graceful fallback,
-and the whole system starts from one `docker compose up`. See `CLAUDE.md` →
-Progress Log for the detailed history.
+and the whole system starts from one `docker compose up`. See `git log` for
+the detailed history.

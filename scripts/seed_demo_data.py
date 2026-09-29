@@ -28,14 +28,13 @@ import auction_pb2_grpc
 APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 TIMEOUT_SECONDS = 3
 
-# A campus clearance auction: end-of-semester hostel move-out sales.
-# Each item is listed by a different seller persona (auto-registered
-# on first login, same as any real user) so the demo doesn't look
-# like one account listing everything.
+# A campus clearance auction: end-of-semester hostel move-out sales, listed by
+# two students clearing out their rooms (accounts register on first login,
+# same as any real user).
 ITEMS = [
     dict(
-        seller="priya_hostel4",
-        password="priya123",
+        seller="tanmay",
+        password="tanmay123",
         title="Hero Sprint 27T cycle - monsoon tested",
         description="Daily-driver cycle for the last 2 years. Gears shift clean, "
                      "seat height adjustable, new tube fitted last month. Selling "
@@ -44,8 +43,8 @@ ITEMS = [
         reserve_price=800.0,
     ),
     dict(
-        seller="arjun_hostel7",
-        password="arjun123",
+        seller="parm",
+        password="parm123",
         title="Mini fridge - survived 3 finals weeks",
         description="Compact enough for a single room, quiet enough to sleep next "
                      "to. Perfect for late-night Maggi and cold coffee stockpiles.",
@@ -53,8 +52,8 @@ ITEMS = [
         reserve_price=500.0,
     ),
     dict(
-        seller="neha_ug3",
-        password="neha123",
+        seller="tanmay",
+        password="tanmay123",
         title="Semester 1 core textbook bundle (Maths, Physics, CS)",
         description="All three, no torn pages, some highlighting in the CS one "
                      "(the useful kind). Would've saved me a week of scrambling.",
@@ -62,8 +61,8 @@ ITEMS = [
         reserve_price=0.0,
     ),
     dict(
-        seller="rohan_hostel2",
-        password="rohan123",
+        seller="parm",
+        password="parm123",
         title="Yamaha F310 acoustic guitar",
         description="Strings changed last month, no dead frets. Learned enough to "
                      "regret not learning more. Case included.",
@@ -71,8 +70,8 @@ ITEMS = [
         reserve_price=1500.0,
     ),
     dict(
-        seller="sara_ug2",
-        password="sara123",
+        seller="tanmay",
+        password="tanmay123",
         title="Table fan - beat the hostel summer heat",
         description="3-speed, oscillates, been running every night since August "
                      "without a single complaint.",
@@ -80,8 +79,8 @@ ITEMS = [
         reserve_price=0.0,
     ),
     dict(
-        seller="vikram_hostel9",
-        password="vikram123",
+        seller="parm",
+        password="parm123",
         title="OASIS fest crew hoodie, size L",
         description="Worn exactly once, on the last day of fest when it actually "
                      "got cold enough to need it.",

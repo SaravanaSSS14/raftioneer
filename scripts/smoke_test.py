@@ -103,7 +103,7 @@ def main() -> int:
     results = [check_app_server(addr) for addr in APP_SERVERS]
     results.append(check_llm_server(LLM_SERVER))
     if all(results):
-        print("\nAll services reachable and honoring the frozen .proto contract.")
+        print("\nAll services reachable and honoring the .proto contract.")
         return 0
     print("\nSome checks failed — see above.")
     return 1

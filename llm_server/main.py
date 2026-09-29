@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import grpc
@@ -59,6 +60,8 @@ OLLAMA_TEMPERATURE = float(
 OLLAMA_MAX_OUTPUT_TOKENS = int(
     os.environ.get("OLLAMA_MAX_OUTPUT_TOKENS", "256")
 )
+
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 
 
 logging.basicConfig(
@@ -240,6 +243,27 @@ class LLMServiceServicer(
         )
 
 
+async def warm_up(llm_client: OllamaClient) -> None:
+    """Load the model into memory at startup, so the first real question
+    doesn't wait for it. Harmless if it fails: the first request loads it."""
+    started = time.monotonic()
+    try:
+        await llm_client.generate(
+            "Reply with the single word: ready.",
+            system=SYSTEM_PROMPT,
+        )
+        log.info(
+            "model %s loaded and warm (%.1fs)",
+            OLLAMA_MODEL,
+            time.monotonic() - started,
+        )
+    except OllamaClientError as exc:
+        log.warning(
+            "model warm-up failed (%s) - it will load on the first request",
+            exc,
+        )
+
+
 async def serve() -> None:
     config = OllamaConfig(
         base_url=OLLAMA_BASE_URL,
@@ -247,6 +271,7 @@ async def serve() -> None:
         timeout_seconds=OLLAMA_TIMEOUT_SECONDS,
         temperature=OLLAMA_TEMPERATURE,
         max_output_tokens=OLLAMA_MAX_OUTPUT_TOKENS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
     )
 
     llm_client = OllamaClient(config)
@@ -276,11 +301,13 @@ async def serve() -> None:
     )
 
     await server.start()
+    warm_up_task = asyncio.create_task(warm_up(llm_client))
 
     try:
         await server.wait_for_termination()
 
     finally:
+        warm_up_task.cancel()
         await llm_client.close()
         await server.stop(grace=2)
 

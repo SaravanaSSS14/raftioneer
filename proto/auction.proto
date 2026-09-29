@@ -2,10 +2,9 @@ syntax = "proto3";
 
 package raftioneer.auction;
 
-// DRAFT — client-facing contract between the app-server (Member A) and
-// business-logic layer (Member B). Frozen once both members sign off;
-// after that, method signature changes require a heads-up before either
-// side implements against them (see README.md conventions).
+// Client-facing contract of the auction service. Everything added after the
+// first version (CreateAuction, AskAssistant, GetAuctionSummary) is purely
+// additive, so older clients keep working unchanged.
 
 // ---- Domain messages ----
 
@@ -38,7 +37,7 @@ message Auction {
   double current_highest_bid = 4;
   string current_highest_bidder_id = 5;
   int64 end_time_ms = 6;
-  double reserve_price = 7; // 0 = no reserve; optional extension (Section 10, reference doc)
+  double reserve_price = 7; // 0 = no reserve
 }
 
 // ---- Auth ----
@@ -83,10 +82,7 @@ message GetAuctionResponse {
 }
 
 // ---- Auction creation ----
-// Added post-freeze: there was no way for any client to get an item
-// or auction into the system at all. Session-gated (any logged-in
-// user can list an item) rather than a separate seller role, to keep
-// M1 scope minimal.
+// Session-gated: any logged-in user can list an item (no separate seller role).
 
 message CreateAuctionRequest {
   string session_token = 1;
@@ -103,10 +99,8 @@ message CreateAuctionResponse {
 }
 
 // ---- Assistant & post-auction results ----
-// Added post-freeze, same category as CreateAuction: purely additive (old
-// clients simply don't know these RPCs exist). The LLM node is only useful
-// if a client can reach it through the app servers, and a closed auction
-// needs somewhere for its outcome (winner, settlement, recap) to be read.
+// Clients reach the LLM node only through the app servers, and read a closed
+// auction's outcome (winner, settlement, recap) back from here.
 
 message AskAssistantRequest {
   string session_token = 1;
@@ -148,8 +142,8 @@ message PlaceBidRequest {
 message PlaceBidResponse {
   bool accepted = 1;
   string error_message = 2;
-  // Set when this node is not the current Raft leader, so the client
-  // (or app-server-to-app-server redirect logic) knows where to retry.
+  // Milestone 2: set when this node is not the Raft leader, so the client
+  // knows where to retry. Always empty in Milestone 1.
   string leader_hint = 3;
   Auction updated_auction = 4;
 }
@@ -160,8 +154,9 @@ service AuctionService {
   rpc ListAuctions(ListAuctionsRequest) returns (ListAuctionsResponse);
   rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
   rpc CreateAuction(CreateAuctionRequest) returns (CreateAuctionResponse);
-  // Accepted only by the current Raft leader; followers respond with
-  // accepted=false and leader_hint set (see README.md, Architecture).
+  // Must beat the highest bid and meet any reserve; sellers cannot bid on
+  // their own auctions. Milestone 1: every replica accepts bids. Milestone 2:
+  // only the Raft leader does - followers reply accepted=false with leader_hint.
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
   // Bidder FAQ, answered by the LLM node with the auction's details injected
   // as context. Never blocks or affects bidding; falls back to plain text.

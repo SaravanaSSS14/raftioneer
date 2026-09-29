@@ -12,7 +12,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "auctions.db")
 
 
 def get_connection() -> sqlite3.Connection:
-    """Get a thread-safe connection with row factory."""
+    """A new connection per call, with rows readable by column name."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -24,10 +24,7 @@ def init_database():
     try:
         conn.execute("PRAGMA foreign_keys = ON")
 
-        # Create Users table - stores the password hash to actually
-        # verify against. Previously missing entirely: Login computed
-        # a hash but never checked it against anything, so any
-        # username/password pair succeeded.
+        # Registered users and their salted password hashes.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
@@ -113,10 +110,9 @@ def init_database():
         """)
 
         conn.commit()
-        print(f"[DB] Database initialized at {DB_PATH}")
-        
-    except sqlite3.Error as e:
-        print(f"[DB] Error initializing database: {e}")
+        log.info("database ready at %s", os.path.abspath(DB_PATH))
+    except sqlite3.Error:
+        log.exception("could not initialize the database")
         raise
     finally:
         conn.close()
@@ -146,6 +142,23 @@ def create_user(username: str, user_id: str, password_hash: str) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
+    finally:
+        conn.close()
+
+
+SESSION_TTL_MS = 3_600_000  # one hour
+
+
+def create_session(session_token: str, user_id: str, username: str) -> None:
+    """Start a session, replacing the user's previous one (one per user)."""
+    conn = get_connection()
+    try:
+        now_ms = datetime.now().timestamp() * 1000
+        conn.execute("""
+            INSERT OR REPLACE INTO sessions (session_token, user_id, username, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_token, user_id, username, now_ms, now_ms + SESSION_TTL_MS))
+        conn.commit()
     finally:
         conn.close()
 
@@ -218,15 +231,7 @@ def get_auction(auction_id: str) -> Optional[dict]:
 
 def create_item(item_id: str, title: str, description: str, seller_id: str,
                  duration_seconds: int = 3600, reserve_price: float = 0.0) -> bool:
-    """Create a new item and an immediately-active auction for it.
-
-    Bug fixes applied here (see Raftioneer_Bug_Solutions_Guide.pdf, Bug 6):
-    the INSERT INTO auctions statement named 9 columns but supplied only
-    6 values (a placeholder-count mismatch) - fixed by matching column
-    and value lists 1:1. Separately, this function never called
-    conn.commit(), so even correct SQL would have been silently rolled
-    back when the connection closed - added below.
-    """
+    """Create a new item and an immediately-active auction for it."""
     conn = get_connection()
     try:
         existing = conn.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
@@ -254,53 +259,60 @@ def create_item(item_id: str, title: str, description: str, seller_id: str,
 
 
 def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, str]:
-    """Create a new bid. Returns (success, error_message or bid_id)."""
+    """Record a bid if it is valid. Returns (accepted, bid_id or the reason it was refused).
+
+    The highest bid is only ever raised by a compare-and-set UPDATE ("set it to X
+    where it is still below X"), so bids racing for the same auction can never let
+    a lower one overwrite a higher one, however they are scheduled.
+    """
     conn = get_connection()
     try:
         now_ms = datetime.now().timestamp() * 1000
-        
-        auction = conn.execute("""SELECT * FROM auctions WHERE auction_id = ?""", (auction_id,)).fetchone()
-
-        if not auction:
+        row = conn.execute("SELECT * FROM auctions WHERE auction_id = ?", (auction_id,)).fetchone()
+        if not row:
             return False, "Auction not found"
-
-        # sqlite3.Row supports [] but not .get() - convert once so both
-        # work below (bug: auction.get(...) on a raw Row raised AttributeError
-        # on every bid that was otherwise valid, before the INSERT ever ran).
-        auction = dict(auction)
+        auction = dict(row)
 
         if auction["status"] != "ACTIVE":
             return False, f"Auction is {auction['status']}, cannot place bid"
-        
+
         if now_ms >= auction["end_time_ms"]:
-            conn.execute("""UPDATE auctions SET status = 'CLOSED' WHERE auction_id = ?""", (auction_id,))
-            conn.commit()  # was missing - this status change would have been silently rolled back
+            # Past its deadline but the timer hasn't ticked yet: close it now.
+            conn.execute("UPDATE auctions SET status = 'CLOSED' WHERE auction_id = ?", (auction_id,))
+            conn.commit()
             return False, "Auction has ended"
-        
+
+        if auction["seller_id"] == bidder_id:
+            return False, "Sellers cannot bid on their own auction"
+
         current_bid = auction["current_highest_bid"] or 0.0
-        
         if amount <= current_bid:
             return False, f"Bid amount must be greater than current highest bid ({current_bid})"
-        
-        if amount < auction.get("reserve_price", 0):
+
+        if amount < (auction["reserve_price"] or 0.0):
             return False, f"Bid does not meet reserve price ({auction['reserve_price']})"
-        
+
+        raised = conn.execute("""
+            UPDATE auctions SET current_highest_bid = ?, current_highest_bidder_id = ?
+            WHERE auction_id = ? AND status = 'ACTIVE' AND current_highest_bid < ?
+        """, (amount, bidder_id, auction_id, amount))
+        if raised.rowcount != 1:  # a higher bid - or the close - landed first
+            conn.rollback()
+            latest = conn.execute(
+                "SELECT status, current_highest_bid FROM auctions WHERE auction_id = ?", (auction_id,)
+            ).fetchone()
+            if latest["status"] != "ACTIVE":
+                return False, f"Auction is {latest['status']}, cannot place bid"
+            return False, f"Bid amount must be greater than current highest bid ({latest['current_highest_bid']})"
+
         bid_id = str(uuid.uuid4())[:8]
-        
         conn.execute("""
             INSERT INTO bids (bid_id, auction_id, bidder_id, amount, timestamp_ms)
             VALUES (?, ?, ?, ?, ?)
         """, (bid_id, auction_id, bidder_id, amount, now_ms))
-        
-        conn.execute("""
-            UPDATE auctions 
-            SET current_highest_bid = ?, current_highest_bidder_id = ?
-            WHERE auction_id = ?
-        """, (amount, bidder_id, auction_id))
-        
         conn.commit()
         return True, bid_id
-        
+
     except sqlite3.Error:
         log.exception("create_bid failed for auction %s", auction_id)
         return False, "Could not record bid, please try again"
@@ -309,16 +321,10 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
 
 
 def close_expired_auctions(now_ms: int) -> list[dict]:
-    """Proactively closes ACTIVE auctions past their end_time_ms and
-    returns the ones just closed, for winner-determination/logging.
-
-    Without this, an auction only ever closed reactively - if someone
-    happened to try bidding on it after it expired (see create_bid
-    above). If nobody did, it stayed ACTIVE forever and no winner was
-    ever recorded. current_highest_bidder_id at close time IS the
-    winner (or "" if no bids were placed) - PlaceBid already refuses
-    bids against a non-ACTIVE auction, so this field can't change
-    again once closed.
+    """Close every ACTIVE auction past its end time and return the ones just
+    closed. current_highest_bidder_id at close time is the winner (or empty if
+    nobody bid); bids against a closed auction are refused, so it can't change
+    afterwards.
     """
     conn = get_connection()
     try:

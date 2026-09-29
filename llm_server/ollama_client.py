@@ -16,6 +16,10 @@ class OllamaConfig:
     timeout_seconds: float = 90.0
     temperature: float = 0.2
     max_output_tokens: int = 256
+    # How long Ollama keeps the model in memory after a request. Its own
+    # default (5 minutes) means a pause mid-demo makes the next answer wait
+    # for the model to load again.
+    keep_alive: str = "30m"
 
 
 class OllamaClient:
@@ -40,6 +44,7 @@ class OllamaClient:
                     "temperature": self.config.temperature,
                     "num_predict": self.config.max_output_tokens,
                 },
+                keep_alive=self.config.keep_alive,
             )
         except ollama.ResponseError as exc:
             raise OllamaClientError(

@@ -1,0 +1,10 @@
+# Keep local state and build junk out of the images (and out of the build
+# context sent to Docker on every build).
+.git
+venv/
+generated/
+**/__pycache__/
+**/*.pyc
+**/*.db
+.pytest_cache/
+tests/

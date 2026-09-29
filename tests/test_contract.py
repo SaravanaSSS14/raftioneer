@@ -157,7 +157,7 @@ def test_open_auction_has_no_settlement_yet(single_stub):
     seller = _login(single_stub, "pytest-seller").session_token
     created = single_stub.CreateAuction(
         auction_pb2.CreateAuctionRequest(
-            session_token=seller, title="pytest open auction", description="d", duration_seconds=600
+            session_token=seller, title="pytest open auction", description="d", duration_seconds=30
         ),
         timeout=APP_TIMEOUT_SECONDS,
     )
@@ -165,6 +165,23 @@ def test_open_auction_has_no_settlement_yet(single_stub):
         auction_pb2.GetAuctionSummaryRequest(auction_id=created.auction_id), timeout=APP_TIMEOUT_SECONDS
     )
     assert resp.found and not resp.closed
+
+
+def test_seller_cannot_bid_on_their_own_auction(single_stub):
+    seller = _login(single_stub, "pytest-seller").session_token
+    created = single_stub.CreateAuction(
+        auction_pb2.CreateAuctionRequest(
+            session_token=seller, title="pytest own-item auction", description="d", duration_seconds=30
+        ),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert created.success, created.error_message
+    bid = single_stub.PlaceBid(
+        auction_pb2.PlaceBidRequest(session_token=seller, auction_id=created.auction_id, amount=10.0),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert not bid.accepted
+    assert "own auction" in bid.error_message
 
 
 def test_closed_auction_reports_winner_settlement_and_recap(single_stub):
@@ -199,16 +216,20 @@ def test_closed_auction_reports_winner_settlement_and_recap(single_stub):
 
 
 def test_closed_auction_with_no_bids_is_a_no_sale(single_stub):
+    # The client node bids on any open auction, so now and then it gets one in
+    # during this auction's single second; retry with a fresh auction if so.
     seller = _login(single_stub, "pytest-seller").session_token
-    created = single_stub.CreateAuction(
-        auction_pb2.CreateAuctionRequest(
-            session_token=seller, title="pytest unloved auction", description="d", duration_seconds=1
-        ),
-        timeout=APP_TIMEOUT_SECONDS,
-    )
-    result = _wait_for_recap(single_stub, created.auction_id)
-
-    assert result.winner_id == ""
+    for _ in range(3):
+        created = single_stub.CreateAuction(
+            auction_pb2.CreateAuctionRequest(
+                session_token=seller, title="pytest unloved auction", description="d", duration_seconds=1
+            ),
+            timeout=APP_TIMEOUT_SECONDS,
+        )
+        result = _wait_for_recap(single_stub, created.auction_id)
+        if result.winner_id == "":
+            break
+    assert result.winner_id == "", "every attempt drew a bid from the client node"
     assert result.final_price == 0.0
     assert result.buyers_premium == 0.0
     assert result.escrow_status == "NO_SALE"

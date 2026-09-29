@@ -42,7 +42,7 @@ def main() -> int:
 
     with grpc.insecure_channel(args.server) as channel:
         stub = auction_pb2_grpc.AuctionServiceStub(channel)
-        student = login(stub, "demo_student", "demo123")
+        student = login(stub, "parm", "parm123")
 
         heading("1. Browse: active auctions")
         active = stub.ListAuctions(
@@ -55,7 +55,8 @@ def main() -> int:
             print(f"  [{a.auction_id}] {a.item.title}  - highest bid {a.current_highest_bid:.2f}{reserve}")
 
         if active:
-            target = active[0]
+            # a listing with a reserve price gives the assistant the most to explain
+            target = next((a for a in active if a.reserve_price > 0), active[0])
             heading(f"2. Ask the assistant about '{target.item.title}'")
             q = "Is this worth bidding on, and can I just bid a little above the current price?"
             print(f"  Q: {q}")
@@ -76,7 +77,7 @@ def main() -> int:
         print(f"  A ({'plain-text fallback' if r.from_fallback else 'LLM'}): {r.answer if r.success else r.error_message}")
 
         heading("4. List an item with NO description - the LLM writes one")
-        seller = login(stub, "sara_ug2", "sara123")
+        seller = login(stub, "tanmay", "tanmay123")
         created = stub.CreateAuction(
             auction_pb2.CreateAuctionRequest(
                 session_token=seller, title="Study lamp with adjustable arm", description="",
@@ -93,10 +94,10 @@ def main() -> int:
 
         heading("5. Two students bid (8-second auction)")
         for username, password, amount in [
-            ("deepika_hostel3", "deepika123", 120.0),
-            ("karan_hostel5", "karan123", 150.0),
-            ("deepika_hostel3", "deepika123", 155.0),
-            ("karan_hostel5", "karan123", 100.0),  # too low - must be rejected
+            ("nisargh", "nisargh123", 120.0),
+            ("nahush", "nahush123", 150.0),
+            ("nisargh", "nisargh123", 155.0),
+            ("nahush", "nahush123", 100.0),  # too low - must be rejected
         ]:
             token = login(stub, username, password)
             resp = stub.PlaceBid(

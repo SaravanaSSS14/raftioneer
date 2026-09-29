@@ -32,6 +32,17 @@ def platform_rules() -> str:
     )
 
 
+def next_bid_rule(highest: float, reserve: float) -> str:
+    """What a new bid has to be, stated outright - small models otherwise
+    work it out for themselves and, for example, call a reserve the
+    "current price" before anyone has bid."""
+    if highest > 0:
+        return f"more than {money(highest)}"
+    if reserve > 0:
+        return f"at least {money(reserve)} (the reserve price)"
+    return "any amount above Rs 0.00"
+
+
 def auction_facts(auction: dict, bid_count: int, now_ms: float) -> str:
     """One line per fact about a single auction, in plain text."""
     lines = [
@@ -40,11 +51,12 @@ def auction_facts(auction: dict, bid_count: int, now_ms: float) -> str:
         f"Status: {auction['status']}",
     ]
     highest = float(auction["current_highest_bid"] or 0.0)
-    lines.append(f"Current highest bid: {money(highest)}" if highest > 0 else "Current highest bid: none yet")
+    lines.append(f"Current highest bid: {money(highest)}" if highest > 0 else "Current highest bid: none yet - nobody has bid")
     lines.append(f"Number of bids: {bid_count}")
     reserve = float(auction.get("reserve_price") or 0.0)
     lines.append(f"Reserve price: {money(reserve)}" if reserve > 0 else "Reserve price: none")
     if auction["status"] == "ACTIVE":
+        lines.append(f"Next bid must be: {next_bid_rule(highest, reserve)}")
         seconds_left = max(0, int((auction["end_time_ms"] - now_ms) / 1000))
         lines.append(f"Time remaining: {seconds_left} seconds")
     return "\n".join(lines)

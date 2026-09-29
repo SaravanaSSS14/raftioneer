@@ -61,6 +61,21 @@ def test_context_reports_no_bids_and_no_reserve_plainly():
 def test_closed_auction_context_has_no_countdown():
     text = assistant.build_context(_auction(status="CLOSED"), 2, NOW_MS)
     assert "Time remaining" not in text
+    assert "Next bid must be" not in text
+
+
+def test_next_bid_before_any_bid_is_the_reserve():
+    text = assistant.build_context(_auction(reserve_price=800.0), 0, NOW_MS)
+    assert "Next bid must be: at least Rs 800.00 (the reserve price)" in text
+
+
+def test_next_bid_after_a_bid_must_beat_it():
+    text = assistant.build_context(_auction(current_highest_bid=805.0, reserve_price=800.0), 1, NOW_MS)
+    assert "Next bid must be: more than Rs 805.00" in text
+
+
+def test_next_bid_with_no_bids_and_no_reserve():
+    assert assistant.next_bid_rule(0.0, 0.0) == "any amount above Rs 0.00"
 
 
 def test_fallback_answer_is_never_empty_and_says_why():

@@ -12,20 +12,19 @@ NODE_ID = os.environ.get("NODE_ID", "client")
 APP_SERVERS = [s for s in os.environ.get("APP_SERVERS", "").split(",") if s]
 CYCLE_INTERVAL_SECONDS = 5
 
-# A pool of named bidders instead of one identity pinging every
-# server — makes a bidding war on scripts/seed_demo_data.py's campus
-# clearance items look like several real people competing, not one
-# account testing itself against 3 replicas. Login auto-registers on
-# first use (same account for the whole demo run after that). Override
-# BIDDER_USERNAME/BIDDER_PASSWORD to pin a single account instead.
+# Named bidders, each with a bidding style (how much they raise the price by),
+# so a bidding war on the seeded campus items reads like real people competing.
+# Accounts register themselves on first login. Set BIDDER_USERNAME /
+# BIDDER_PASSWORD to bid as a single account instead.
 BIDDER_PERSONAS = [
-    ("deepika_hostel3", "deepika123"),
-    ("karan_hostel5", "karan123"),
-    ("ananya_ug1", "ananya123"),
-    ("farhan_hostel8", "farhan123"),
+    # username, password, smallest and largest raise in Rs
+    ("nisargh", "nisargh123", 25, 60),  # goes in big
+    ("nahush", "nahush123", 10, 30),
+    ("karan", "karan123", 3, 12),
+    ("mrudul", "mrudul123", 1, 5),  # inches the price up
 ]
 if os.environ.get("BIDDER_USERNAME"):
-    BIDDER_PERSONAS = [(os.environ["BIDDER_USERNAME"], os.environ.get("BIDDER_PASSWORD", ""))]
+    BIDDER_PERSONAS = [(os.environ["BIDDER_USERNAME"], os.environ.get("BIDDER_PASSWORD", ""), 1, 10)]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,12 +34,8 @@ log = logging.getLogger(__name__)
 
 
 async def run_bidder_cycle(address: str) -> None:
-    """Walks the real client flow against one app server: Login ->
-    ListAuctions -> PlaceBid. Written against the frozen .proto contract,
-    not today's stub responses — every step just logs how far it got,
-    so this same code keeps working (and does more) as real business
-    logic lands, with no changes needed here."""
-    username, password = random.choice(BIDDER_PERSONAS)
+    """One persona's turn against one app server: Login -> ListAuctions -> PlaceBid."""
+    username, password, min_raise, max_raise = random.choice(BIDDER_PERSONAS)
     try:
         async with grpc.aio.insecure_channel(address) as channel:
             stub = auction_pb2_grpc.AuctionServiceStub(channel)
@@ -63,11 +58,9 @@ async def run_bidder_cycle(address: str) -> None:
                 return
 
             auction = random.choice(list_resp.auctions)
-            # A real bidder checks the reserve, not just the current
-            # highest bid — otherwise every early bid on a seeded item
-            # with a reserve_price would bid too low to ever succeed.
+            # Start from the reserve if nobody has bid yet - a bid below it is refused.
             floor = max(auction.current_highest_bid, auction.reserve_price)
-            bid_amount = floor + round(random.uniform(1, 10), 2)
+            bid_amount = round(floor + random.uniform(min_raise, max_raise), 2)
 
             bid_resp = await stub.PlaceBid(
                 auction_pb2.PlaceBidRequest(

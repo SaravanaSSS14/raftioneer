@@ -37,7 +37,8 @@ async def run(server: str, bidders: int, bids: int) -> int:
         created = await stub.CreateAuction(
             auction_pb2.CreateAuctionRequest(
                 session_token=seller.session_token, title="Stress-test item",
-                description="Created by scripts/stress_bids.py", duration_seconds=600, reserve_price=0.0,
+                # long enough for the storm; short enough not to linger on the board afterwards
+                description="Created by scripts/stress_bids.py", duration_seconds=60, reserve_price=0.0,
             )
         )
         if not created.success:

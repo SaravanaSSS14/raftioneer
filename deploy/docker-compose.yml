@@ -1,3 +1,13 @@
+# Raftioneer - the whole five-node system from one command:
+#   docker compose -f deploy/docker-compose.yml up --build
+
+# The three app-server replicas share one image and differ only in identity.
+x-app-server: &app-server
+  build:
+    context: ..
+    dockerfile: app_server/Dockerfile
+  image: raftioneer-app-server
+
 services:
   # ---- Node 1: the LLM node -------------------------------------------
   # llm_server is the gRPC face (independent of the auction cluster, holds
@@ -30,12 +40,14 @@ services:
     build:
       context: ..
       dockerfile: llm_server/Dockerfile
+    image: raftioneer-llm-server
     environment:
       - NODE_ID=llm-server
       - PORT=50060
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=qwen2.5:1.5b
       - OLLAMA_TIMEOUT_SECONDS=90
+      - OLLAMA_KEEP_ALIVE=30m
     depends_on:
       ollama_pull:
         condition: service_completed_successfully
@@ -46,10 +58,9 @@ services:
   # The app servers deliberately do NOT depend on the LLM node: bidding
   # must work even if the AI layer is slow, still downloading its model,
   # or down. LLM features degrade to a plain-text fallback instead.
+  # PEERS lists the other replicas; Raft (Milestone 2) uses it.
   app_server_1:
-    build:
-      context: ..
-      dockerfile: app_server/Dockerfile
+    <<: *app-server
     environment:
       - NODE_ID=app-server-1
       - PORT=50051
@@ -59,9 +70,7 @@ services:
       - "50051:50051"
 
   app_server_2:
-    build:
-      context: ..
-      dockerfile: app_server/Dockerfile
+    <<: *app-server
     environment:
       - NODE_ID=app-server-2
       - PORT=50051
@@ -71,9 +80,7 @@ services:
       - "50052:50051"
 
   app_server_3:
-    build:
-      context: ..
-      dockerfile: app_server/Dockerfile
+    <<: *app-server
     environment:
       - NODE_ID=app-server-3
       - PORT=50051
@@ -87,6 +94,7 @@ services:
     build:
       context: ..
       dockerfile: client/Dockerfile
+    image: raftioneer-client
     environment:
       - NODE_ID=client
       - APP_SERVERS=app_server_1:50051,app_server_2:50051,app_server_3:50051

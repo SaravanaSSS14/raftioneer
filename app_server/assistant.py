@@ -1,14 +1,20 @@
 """Text and arithmetic for the assistant and the post-auction settlement.
 
 Deliberately free of I/O and gRPC so it can be unit tested without a
-running stack. Two jobs:
+running stack. Three jobs:
 
 * build the context injected into every LLM call (the LLM node holds no
-  auction state of its own - it only sees what we hand it per call), and
+  auction state of its own - it only sees what we hand it per call),
 * the plain-text fallbacks used when the LLM node is unreachable, so the
-  AI layer being slow or down never breaks a feature, let alone a bid.
+  AI layer being slow or down never breaks a feature, let alone a bid, and
+* keep the model honest: the fine print appended to its answers and the
+  fact check on its recaps, both computed from the auction itself.
+
+Tapri's deterministic lines have a dry streak - facts first, personality
+second, and never a fact that isn't true.
 """
 import os
+import re
 from typing import Optional
 
 # Mock commission added on top of the winning bid at settlement.
@@ -81,13 +87,34 @@ def build_context(auction: Optional[dict], bid_count: int, now_ms: float) -> str
 
 def fallback_answer(auction: Optional[dict], bid_count: int, now_ms: float) -> str:
     return (
-        "The assistant is offline right now, so here is what I can tell you directly.\n"
+        "Tapri is offline on a chai break (the LLM node isn't answering), so here are the plain "
+        "facts - less charming, entirely accurate.\n"
         + build_context(auction, bid_count, now_ms)
     )
 
 
 def fallback_description(title: str) -> str:
-    return f"{title.strip()} - listed by a student for the campus clearance auction."
+    return (
+        f"{title.strip()} - leaving a hostel room near you. The description writer is offline; "
+        "the seller is presumably busy packing."
+    )
+
+
+def fine_print(auction: dict, bid_count: int, now_ms: float) -> str:
+    """The facts that matter for a bid, read from the auction itself and
+    appended to the model's answer - so even when the model gets one wrong
+    (it once told a bidder to go "a little above 0" past a Rs 800 reserve),
+    the correct figure is right there underneath."""
+    if auction["status"] != "ACTIVE":
+        return f"Fine print, from the auction rather than the model: this auction is {auction['status'].lower()}."
+    highest = float(auction["current_highest_bid"] or 0.0)
+    reserve = float(auction.get("reserve_price") or 0.0)
+    seconds_left = max(0, int((auction["end_time_ms"] - now_ms) / 1000))
+    bids = "1 bid" if bid_count == 1 else f"{bid_count} bids"
+    return (
+        "Fine print, from the auction rather than the model: next bid must be "
+        f"{next_bid_rule(highest, reserve)}; {bids} so far; closes in {seconds_left} seconds."
+    )
 
 
 def compute_settlement(final_price: float, has_winner: bool,
@@ -123,9 +150,40 @@ def fallback_summary(
     average_sale_price: Optional[float] = None,
 ) -> str:
     if not bid_amounts:
-        return f"{title} closed with no bids."
+        return f"{title} closed with no bids. It stays in the hostel, unloved and, more to the point, unsold."
     n = len(bid_amounts)
     bids = "1 bid" if n == 1 else f"{n} bids"
     winner = f" Winner: {winner_name}." if winner_name else ""
     trend = describe_trend(final_price, average_sale_price)
     return f"{title} sold for {money(final_price)} after {bids}, opening at {money(bid_amounts[0])}.{winner}{trend}"
+
+
+_COUNT_WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+                "nineteen", "twenty"]
+
+
+def recap_matches_facts(text: str, bid_count: int, final_price: float) -> bool:
+    """Does an LLM-written recap state the right number of bids and the right
+    final price, and no other bid count? The model writes, the code checks:
+    a recap that fails is replaced by the template (which can't miscount)."""
+    plain = text.lower().replace(",", "")
+    counts = set()
+    for match in re.finditer(r"\b(\d+|[a-z]+)\s+(?:recorded\s+|accepted\s+|total\s+)?bids?\b", plain):
+        word = match.group(1)
+        if word.isdigit():
+            counts.add(int(word))
+        elif word in _COUNT_WORDS:
+            counts.add(_COUNT_WORDS.index(word))
+        elif word == "zero":
+            counts.add(0)
+        elif word == "single":
+            counts.add(1)
+    if counts != {bid_count}:
+        return False
+    if bid_count == 0:
+        return True
+    forms = [re.escape(f"{final_price:.2f}")]
+    if final_price == int(final_price):
+        forms.append(rf"{int(final_price)}(?!\.\d)")
+    return any(re.search(rf"(?<![\d.]){form}(?!\d)", plain) for form in forms)

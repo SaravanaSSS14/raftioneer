@@ -127,7 +127,7 @@ def test_fallback_summary_omits_trend_without_an_average():
 def test_fallback_summary_with_no_bids_never_mentions_trend():
     # No sale happened at all - a trend clause here would be nonsensical.
     text = assistant.fallback_summary("Table fan", [], 0.0, None, average_sale_price=100.0)
-    assert text == "Table fan closed with no bids."
+    assert text.startswith("Table fan closed with no bids.") and "average" not in text
 
 
 def test_fallback_summary_uses_singular_for_one_bid():
@@ -135,7 +135,7 @@ def test_fallback_summary_uses_singular_for_one_bid():
 
 
 def test_fallback_summary_with_no_bids():
-    assert assistant.fallback_summary("Table fan", [], 0.0, None) == "Table fan closed with no bids."
+    assert assistant.fallback_summary("Table fan", [], 0.0, None).startswith("Table fan closed with no bids.")
 
 
 def test_fallback_description_mentions_the_title():
@@ -156,3 +156,46 @@ def test_context_states_the_anti_sniping_rule_and_any_extension():
 
 def test_context_without_anti_sniping_does_not_mention_it():
     assert "Anti-sniping" not in assistant.auction_facts(_auction(), 0, NOW_MS)
+
+
+# ---- keeping the model honest ----
+
+
+def test_fine_print_states_the_next_valid_bid_from_the_auction():
+    text = assistant.fine_print(_auction(reserve_price=800.0), 0, NOW_MS)
+    assert "next bid must be at least Rs 800.00 (the reserve price)" in text
+    assert "0 bids so far" in text and "closes in 90 seconds" in text
+
+
+def test_fine_print_for_a_closed_auction_says_so():
+    assert "closed" in assistant.fine_print(_auction(status="CLOSED"), 3, NOW_MS)
+
+
+# The recap the model actually wrote on Oct 20, for 4 bids ending at 170.00:
+MISCOUNTED = ("This Raftioneer auction concluded with the study lamp with an adjustable arm selling for "
+              "170.00 rupees. There were three bids recorded: 120.00, 150.00, and 155.00, leading to the "
+              "final price of 170.00 rupees.")
+
+
+def test_recap_fact_check_catches_the_miscount_from_the_tour():
+    assert not assistant.recap_matches_facts(MISCOUNTED, 4, 170.0)
+
+
+def test_recap_fact_check_accepts_a_correct_recap_in_digits_or_words():
+    assert assistant.recap_matches_facts("Four bids came in and the lamp sold for Rs 170.", 4, 170.0)
+    assert assistant.recap_matches_facts("After 4 bids it sold at 170.00 rupees.", 4, 170.0)
+    assert assistant.recap_matches_facts("A single bid of Rs 1,553.03 took it.", 1, 1553.03)
+
+
+def test_recap_fact_check_rejects_a_wrong_price_or_a_missing_count():
+    assert not assistant.recap_matches_facts("After 4 bids it sold at Rs 175.", 4, 170.0)
+    assert not assistant.recap_matches_facts("It sold for Rs 1700 after 4 bids.", 4, 170.0)
+    assert not assistant.recap_matches_facts("The lamp sold for Rs 170 after a lively contest.", 4, 170.0)
+
+
+def test_recap_fact_check_with_no_bids():
+    assert assistant.recap_matches_facts("The fan closed with no bids.", 0, 0.0)
+    # the model's own wording on Oct 20, wrongly rejected by the first version of the check
+    assert assistant.recap_matches_facts("This auction saw zero bids, resulting in a final price of 0.00.", 0, 0.0)
+    assert not assistant.recap_matches_facts("The fan sold after 2 bids.", 0, 0.0)
+

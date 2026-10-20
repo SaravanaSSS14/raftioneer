@@ -112,6 +112,9 @@ Auction ID:
 Item title:
 {item_title}
 
+Number of bids (already counted - use exactly this number):
+{len(bid_history)}
+
 Bid history:
 {bids}
 
@@ -123,7 +126,7 @@ average, say nothing about pricing if it says no average exists yet. Never call 
 never mention that it was computed or provided to you - just state it as part of the summary:
 {trend_fact}
 
-Write 2-4 sentences. State the number of bids and final price. Do not compute your own
+Write 2-4 sentences. State the number of bids exactly as counted above, and the final price. Do not compute your own
 percentage or direction for the pricing trend, and do not change the numbers given.
 Do not infer a winner name, bidder identity, demand level, or other facts that are not provided.
 """

@@ -89,13 +89,25 @@ and recaps every sale.
 - Writes a listing when a seller leaves the description blank.
 - Writes a recap of every closed auction, including how the price compares to the average of
   earlier sales.
+- **Kept honest:** every answer about an auction ends with *fine print* read from the replicated
+  state (the next valid bid, the bid count, the time left), and every LLM recap is fact-checked —
+  the wrong bid count or price and it is replaced by the template before it reaches the log.
 - **Never on the bidding or consensus path:** if the LLM node is slow, loading, or down, every
   feature falls back to plain text and bidding is unaffected.
+
+**Presentation**
+- **One-command demo** — `scripts/demo.py` runs the whole Milestone 2 story in six narrated acts,
+  pausing between them; `scripts/cluster.py --watch` shows elections live in a second terminal.
+- **A narrator with a dry streak** — after each key moment the demo scripts add a one-line aside
+  ("app-server-3 has left the chat. Nobody held a funeral; they held an election."). Facts are
+  always printed first and plainly; the asides never replace one, and `RAFTIONEER_SERIOUS=1` (or
+  `--serious`) switches them off. The client node's personas and Tapri's fallback text share the
+  same voice.
 
 **Tooling**
 - Cluster status, an automated leader-failover check, a chaos run, a consistency checker, themed
   seed data, a guided tour, an auction board with replica agreement and anti-sniping extensions, a
-  concurrency stress test, smoke tests, and a 99-test pytest suite (including Raft tests with
+  concurrency stress test, smoke tests, and a 105-test pytest suite (including Raft tests with
   simulated crashes and network partitions).
 
 ## Architecture
@@ -136,7 +148,9 @@ and settles the auction, and the recap is committed as `SAVE_SUMMARY`.
 | The algorithm | [`raft/node.py`](app_server/raft/node.py) | roles, election timer, `RequestVote` / `AppendEntries` handlers, replication, commit, apply |
 | Node-to-node RPC | [`raft/transport.py`](app_server/raft/transport.py) | gRPC client and servicer for `RaftService` |
 | State machine | [`state_machine.py`](app_server/state_machine.py) | what each committed command does to the auction database — deterministic on every node |
-| Wiring | [`main.py`](app_server/main.py) | leader-only writes, `leader_hint` redirects, the leader-run auction timer, `GetClusterStatus` |
+| Client service | [`service.py`](app_server/service.py) | leader-only writes, `leader_hint` redirects, reads from any node, `GetClusterStatus` |
+| Auction clock | [`auction_timer.py`](app_server/auction_timer.py) | the leader-run timer: closes, settlements and recaps through the log |
+| Wiring | [`main.py`](app_server/main.py) and [`config.py`](app_server/config.py) | starts the node; every setting from the environment |
 
 - **The log is the source of truth.** Each node's SQLite auction database is rebuilt from the log
   every time the node starts.
@@ -174,13 +188,18 @@ proto/          gRPC contracts: auction.proto (client-facing), raft.proto (node 
 app_server/     auction node
   raft/         Raft: storage.py (persistent state), node.py (the algorithm), transport.py (gRPC)
   state_machine.py   the replicated commands and what applying each one does
-  main.py       RPC handlers, leader-only writes, the auction timer, startup
+  service.py    the gRPC AuctionService: leader-only writes, reads from any node
+  auction_timer.py   closing, settling and recapping auctions, from the leader
+  assistant.py  the assistant's context, fallbacks, fine print and recap fact check
+  config.py     every setting, from environment variables
+  main.py       wires it all together and starts the node
   store/        SQLite data access and password hashing
 llm_server/     LLM node: gRPC service, Ollama client, prompts
 client/         bidder simulation (four named personas), leader-aware
 deploy/         docker-compose.yml - the whole system
-scripts/        cluster status, failover check, chaos run, consistency check, seeding,
-                guided tour, auction board, stress test, smoke tests, stub generation
+scripts/        demo.py (the whole demo), cluster status, failover check, chaos run,
+                consistency check, seeding, guided tour, auction board, stress test, smoke
+                tests, narrate.py (shared presentation helpers), stub generation
 tests/          pytest: Raft and state-machine tests (no Docker), contract tests (live stack)
 ```
 
@@ -235,6 +254,26 @@ localhost:50053   app-server-3   FOLLOWER       1 app-server-2        5       5 
 ```
 
 ## Demo walkthrough
+
+**The whole thing in one command** — six acts, each introduced, run, and paused on until you press
+Enter (`--auto` runs straight through, `--serious` drops the narrator's asides, `--from 4` starts
+at act 4):
+
+```bash
+python scripts/demo.py
+python scripts/cluster.py --watch     # in a second terminal: roles and terms, live
+```
+
+| Act | What it shows | Script |
+| --- | --- | --- |
+| 1. The cluster | who leads, each node's log | `cluster.py` |
+| 2. One write, three copies | seeded once, listed by every replica | `seed_demo_data.py`, `board.py` |
+| 3. The auction | assistant with fine print, anti-sniping, a retried bid, the close | `demo_queries.py` |
+| 4. Kill the leader | a crash mid-auction, a new leader, nothing lost | `failover_check.py` |
+| 5. Chaos | two rounds of faults, then every safety check | `chaos.py --rounds 2 --seed 3` |
+| 6. Under load | 400 simultaneous bids, every replica agrees | `stress_bids.py` |
+
+Each act is an ordinary script, described below, and can be run on its own.
 
 **Seed the demo data** — six themed auctions (listed by Tanmay and Parm), created once through the
 leader and replicated to every app server:
@@ -432,7 +471,13 @@ servers: `GetLLMAnswer`, `GenerateItemDescription`, `SummarizeAuction`.
 - **The LLM is optional infrastructure.** No bid ever waits on it; each LLM-backed feature has a
   deterministic fallback and says so (`from_fallback`, `summary_from_fallback`).
 - **Facts are computed, never inferred by the model.** The model gets finished statements (the next
-  valid bid, the pricing trend); a 1.5B model is fluent but unreliable at arithmetic.
+  valid bid, the pricing trend, the number of bids); a 1.5B model is fluent but unreliable at
+  arithmetic.
+- **The model writes, the code checks.** Answers carry fine print from the replicated state; recaps
+  that misstate the bid count or the price are replaced by the template before they are committed.
+- **Personality is a layer, not a substitute.** The narrator's asides and Tapri's dry fallbacks are
+  printed after the facts, rotate deterministically (a recording reads the same every time), and
+  switch off with `RAFTIONEER_SERIOUS=1`.
 - **Additive contract changes only.** Every RPC and field added since the contract was frozen
   (`CreateAuction`, `AskAssistant`, `GetAuctionSummary`, `GetClusterStatus`, `ListBids`, the
   `leader_hint`s, `request_id` / `replayed`, `original_end_time_ms`, `applied_digest`)
@@ -457,7 +502,7 @@ pytest tests/test_raft.py tests/test_state_machine.py tests/test_assistant.py \
   anti-sniping extends within the window and stops at the cap; a retried bid gets its original
   answer and is recorded once.
 
-With the system running, the whole suite (99 tests, about 35 s):
+With the system running, the whole suite (105 tests, about 40 s):
 
 ```bash
 pytest tests/
@@ -493,6 +538,8 @@ pytest tests/
 | `OLLAMA_KEEP_ALIVE` | llm_server | `30m` | How long the model stays in memory between requests |
 | `APP_SERVERS` | client | unset (compose: the three app servers) | Where to find the cluster |
 | `BIDDER_USERNAME` / `BIDDER_PASSWORD` | client | unset | Bid as one account instead of the personas |
+| `RAFTIONEER_SERIOUS` | client, scripts | unset | `1` = no narrator asides or persona reactions — facts only |
+| `NO_COLOR` | scripts | unset | Set it to keep the scripts' output free of colour |
 
 ## Troubleshooting
 
@@ -520,7 +567,9 @@ pytest tests/
 - No pre-vote or check-quorum: a node that was cut off can force one extra election when it
   rejoins, and a leader that has lost its majority keeps believing it leads until it hears a higher
   term (its writes time out rather than redirect).
-- The 1.5B model occasionally over-generalizes a fact; the templated fallback never does.
+- The 1.5B model still phrases facts loosely now and then (it once told a bidder to go "a little
+  above 0" past a Rs 800 reserve). The fine print under every answer states the correct figure, and
+  recaps are fact-checked, but the model's own sentence is shown as written.
 - Escrow is a mock by design: nothing is charged.
 - Foreign keys are declared but not enforced, and the gRPC channels are unencrypted (fine for a
   local deployment).

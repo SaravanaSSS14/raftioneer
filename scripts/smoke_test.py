@@ -22,6 +22,7 @@ import auction_pb2
 import auction_pb2_grpc
 import llm_pb2
 import llm_pb2_grpc
+from cluster import statuses
 APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 LLM_SERVER = "localhost:50060"
 TIMEOUT_SECONDS = 3
@@ -73,13 +74,15 @@ def check_app_server(address: str) -> bool:
                 auction_pb2.GetAuctionSummaryRequest(auction_id=bogus_id), timeout=TIMEOUT_SECONDS
             )
             assert not summary.found, f"GetAuctionSummary reported found=True for a made-up id ({bogus_id})"
+            history = stub.ListBids(auction_pb2.ListBidsRequest(auction_id=bogus_id), timeout=TIMEOUT_SECONDS)
+            assert not history.found and not history.bids, f"ListBids returned bids for a made-up id ({bogus_id})"
 
             # Logout must not error, valid session or not.
             stub.Logout(auction_pb2.LogoutRequest(session_token=""), timeout=TIMEOUT_SECONDS)
 
         print(
             f"OK   {address}  (Login, ListAuctions, GetAuction, PlaceBid, "
-            "AskAssistant, GetAuctionSummary, Logout all well-formed)"
+            "AskAssistant, GetAuctionSummary, ListBids, Logout all well-formed)"
         )
         return True
     except (grpc.RpcError, AssertionError) as exc:
@@ -99,8 +102,25 @@ def check_llm_server(address: str) -> bool:
         return False
 
 
+def check_cluster(addresses: list[str]) -> bool:
+    """The app servers form one Raft cluster: exactly one leader, and every
+    node agrees who it is."""
+    reachable = [s for _, s in statuses(addresses) if s is not None]
+    leaders = [s for s in reachable if s.role == "LEADER"]
+    if len(leaders) != 1:
+        print(f"FAIL cluster  ({len(leaders)} leaders among {len(reachable)} reachable app servers)")
+        return False
+    disagree = [s.node_id for s in reachable if s.leader_id != leaders[0].node_id]
+    if disagree:
+        print(f"FAIL cluster  ({', '.join(disagree)} not following {leaders[0].node_id})")
+        return False
+    print(f"OK   cluster  (leader {leaders[0].node_id}, term {leaders[0].term}, {len(reachable)} nodes agree)")
+    return True
+
+
 def main() -> int:
     results = [check_app_server(addr) for addr in APP_SERVERS]
+    results.append(check_cluster(APP_SERVERS))
     results.append(check_llm_server(LLM_SERVER))
     if all(results):
         print("\nAll services reachable and honoring the .proto contract.")

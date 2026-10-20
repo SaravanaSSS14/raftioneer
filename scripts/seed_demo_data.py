@@ -6,10 +6,8 @@ exists, but nothing calls it automatically. This is that one-off call.
 Uses only the AuctionService contract (Login auto-registers a seller on
 first use, then CreateAuction) - no new RPCs, no schema changes.
 
-Each app-server replica has its own separate SQLite file (replication
-between replicas is Milestone 2), so this seeds every replica in
-APP_SERVERS identically - otherwise only whichever replica you happened
-to call would ever show these auctions in ListAuctions.
+Each auction is created once, on the Raft leader; Raft replicates it to
+every app server, so all of them list it.
 
 Usage (with the stack already up):
     source venv/bin/activate
@@ -24,8 +22,8 @@ sys.path.insert(0, "generated")
 
 import auction_pb2
 import auction_pb2_grpc
+from cluster import DEFAULT_SERVERS, find_leader, wait_until_replicated
 
-APP_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 TIMEOUT_SECONDS = 3
 
 # A campus clearance auction: end-of-semester hostel move-out sales, listed by
@@ -122,14 +120,16 @@ def seed_on(address: str) -> int:
 
 
 def main() -> int:
-    total = 0
-    for address in APP_SERVERS:
-        try:
-            print(f"Seeding {address} ...")
-            total += seed_on(address)
-        except grpc.RpcError as exc:
-            print(f"  ! {address}: unreachable ({exc.code()})")
-    print(f"\n{total} auction(s) created across {len(APP_SERVERS)} replica(s).")
+    try:
+        leader = find_leader(DEFAULT_SERVERS)
+        print(f"Seeding through the leader at {leader} ...")
+        total = seed_on(leader)
+    except (grpc.RpcError, TimeoutError) as exc:
+        print(f"  ! could not seed: {exc}")
+        return 1
+    replicated = wait_until_replicated(DEFAULT_SERVERS)
+    print(f"\n{total} auction(s) created" + (", replicated to every app server." if replicated else
+          " (some app servers have not caught up yet - check scripts/cluster.py)."))
     return 0 if total else 1
 
 

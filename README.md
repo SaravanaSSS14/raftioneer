@@ -1,18 +1,24 @@
 # Raftioneer — Distributed Online Auction System
 
-A distributed online auction built with **gRPC in Python**: three auction-server
-replicas, an independent **LLM node**, and a simulated bidder client, all started
-from a single `docker compose up`.
+A fault-tolerant online auction built with **gRPC in Python** and a from-scratch **Raft**
+implementation: three auction servers that replicate every write through a Raft log, an
+independent **LLM node**, and a simulated bidder client, all started from a single
+`docker compose up`.
 
 The demo theme is a *campus clearance auction* — students listing what they leave
 behind at the end of the semester (a cycle, a mini-fridge, a guitar) and bidding on
 each other's — with an LLM assistant that answers bidder questions, writes listings,
 and recaps every sale.
 
-> **Status — Milestone 1 complete:** gRPC services, session authentication,
-> concurrency-safe bidding, automatic auction close and winner determination,
-> mock escrow settlement, and LLM integration with graceful degradation.
-> **Milestone 2** adds Raft consensus and fault tolerance across the replicas.
+> **Status — Milestone 2 core and extensions complete:** leader election, log replication
+> with a disk-persisted log, failure detection and automatic recovery, leader-only writes
+> with client redirects, and a replicated auction state machine — plus three extensions:
+> **anti-sniping** as replicated timer state, **exactly-once bids**, and a **chaos run with a
+> consistency checker** that kills, freezes and partitions nodes while bids keep coming.
+> Kill the leader mid-auction and a new one takes over in about a second with no committed
+> bid lost.
+> Milestone 1 (gRPC services, auth, concurrency-safe bidding, timer and winner, mock
+> escrow, LLM integration) is unchanged underneath and still fully working.
 
 *Advanced Operating Systems (CS G623) · BITS Pilani, Pilani Campus · First Semester 2026–27*
 
@@ -22,32 +28,60 @@ and recaps every sale.
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [How Raft is used here](#how-raft-is-used-here)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
 - [Getting started](#getting-started)
 - [Demo walkthrough](#demo-walkthrough)
+- [Fault-tolerance demo](#fault-tolerance-demo)
 - [API overview](#api-overview)
 - [Design decisions](#design-decisions)
 - [Testing](#testing)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
-- [Roadmap: Milestone 2](#roadmap-milestone-2)
 - [Team](#team)
 
 ---
 
 ## Features
 
+**Raft consensus** (`app_server/raft/`, written from Figure 2 of the Raft paper)
+- **Leader election** — `RequestVote`, randomized election timeouts, terms, one vote per term,
+  and the election restriction (only a candidate with an up-to-date log can win).
+- **Log replication** — `AppendEntries` with the consistency check, conflict repair, and
+  commit on a majority; a new leader commits a no-op to settle entries from earlier terms.
+- **Persistence** — the term, the vote and the log are on disk (SQLite, fsync) before a node
+  replies to any RPC, so a restarted node picks up exactly where it was.
+- **Failure detection** — heartbeats every 200 ms; a follower that hears nothing for a random
+  0.8–1.6 s starts an election.
+- **Replicated state machine** — every write (login, new auction, bid, auction close and
+  settlement, recap) is a log entry that every node applies in the same order.
+
 **Auctions and bidding**
 - Session-based login with salted PBKDF2 password hashing; accounts register on first login.
 - Create auctions with a duration and an optional reserve price; browse, filter by status, or fetch one.
-- Bid validation: a bid must beat the current highest bid and meet any reserve, and sellers cannot
-  bid on their own auctions.
-- Concurrency-safe: the highest bid only moves through a compare-and-set update, so simultaneous
-  bids can never lose or overwrite a higher one (verified with 400 simultaneous bids per replica).
-- A background timer closes expired auctions, determines the winner, and records a **mock escrow
-  settlement** with a 5% buyer's premium (`HELD (mock)`, or `NO_SALE` when nobody bid).
+- Bid validation: a bid must be a positive amount, beat the current highest bid and meet any
+  reserve, and sellers cannot bid on their own auctions.
+- Concurrency-safe: bids are decided in log order, and the highest bid only moves through a
+  compare-and-set update (verified with 400 simultaneous bids; every replica agrees afterwards).
+- The leader's timer closes expired auctions, determines the winner, and records a **mock escrow
+  settlement** with a 5% buyer's premium (`HELD (mock)`, or `NO_SALE` when nobody bid) — through
+  the log, so a leader crash never loses the auction clock.
+
+**Extensions** (Milestone 2, beyond the required core)
+- **Anti-sniping** — a bid in an auction's last 10 s pushes its end to 10 s after that bid, up to
+  60 s past the original end. The rule is fixed when the auction is listed and the moved end time is
+  replicated state, so every node closes the auction at the same moment, whoever is leader.
+- **Exactly-once bids** — a client may tag a bid with a `request_id`. The state machine records the
+  outcome of every tagged bid, so a retry after a timeout or a leader change gets the *original*
+  answer back (`replayed=true`) instead of being applied again — or, worse, being refused as "not
+  higher than the current bid" when the first attempt had actually won.
+- **Chaos run and consistency checker** — `scripts/chaos.py` kills leaders and followers, freezes a
+  leader (a "zombie"), strands a leader without its majority, and cuts a leader off the network,
+  while a bidder keeps bidding; `scripts/consistency_check.py` then proves every replica holds
+  identical state (same applied-log digest, auctions, bid histories and outcomes), no term ever had
+  two leaders, and every bid was recorded exactly once.
 
 **LLM integration** (an independent node — the app servers call it over gRPC)
 - **Tapri**, the bidder assistant (named after the campus chai stall): answers questions with the
@@ -55,46 +89,79 @@ and recaps every sale.
 - Writes a listing when a seller leaves the description blank.
 - Writes a recap of every closed auction, including how the price compares to the average of
   earlier sales.
-- **Never on the bidding path:** if the LLM node is slow, loading, or down, every feature falls back
-  to plain text and bidding is unaffected.
+- **Never on the bidding or consensus path:** if the LLM node is slow, loading, or down, every
+  feature falls back to plain text and bidding is unaffected.
 
 **Tooling**
-- Themed seed data, a guided tour, an auction board, a concurrency stress test, smoke tests, and a
-  59-test pytest suite.
+- Cluster status, an automated leader-failover check, a chaos run, a consistency checker, themed
+  seed data, a guided tour, an auction board with replica agreement and anti-sniping extensions, a
+  concurrency stress test, smoke tests, and a 99-test pytest suite (including Raft tests with
+  simulated crashes and network partitions).
 
 ## Architecture
 
 ```
-                 ┌──────────────┐        ┌──────────────┐       ┌──────────────┐
-   client  ────▶ │ app_server_1 │ ─────▶ │  llm_server  │ ────▶ │    ollama    │
- (4 bidder       │ app_server_2 │  gRPC  │ (gRPC face,  │ HTTP  │ qwen2.5:1.5b │
-  personas)      │ app_server_3 │        │  stateless)  │       │    (CPU)     │
-     gRPC        └──────────────┘        └──────────────┘       └──────────────┘
-                  auth · auctions ·        LLM node (Node 1)
-                  bids · timer · escrow
-                  each with its own SQLite database
+                 ┌───────────────────────────┐        ┌──────────────┐       ┌──────────────┐
+   client  ────▶ │  app_server_1  (leader)   │ ─────▶ │  llm_server  │ ────▶ │    ollama    │
+ (4 bidder       │      │  AppendEntries     │  gRPC  │ (gRPC face,  │ HTTP  │ qwen2.5:1.5b │
+  personas)      │      ▼  RequestVote       │        │  stateless)  │       │    (CPU)     │
+     gRPC        │  app_server_2  app_server_3        └──────────────┘       └──────────────┘
+                 │  (followers)              │          LLM node (Node 1)
+                 └───────────────────────────┘
+                   one Raft cluster: each node keeps the Raft log on disk
+                   and a SQLite copy of the auction state built from it
 ```
 
-- **Five nodes:** the LLM node, three app-server replicas, and the client. The LLM node is
-  `llm_server` (the gRPC service) plus its `ollama` model backend.
-- **All inter-service traffic is gRPC** ([`proto/`](proto/)). The only HTTP hop is
-  `llm_server → ollama`, inside the LLM node.
-- **The LLM node holds no auction state.** App servers inject the facts it needs on every call.
-- **Each replica keeps its own SQLite database** in Milestone 1; replicating state between them
-  with Raft is Milestone 2.
+- **Five nodes:** the LLM node, three app servers forming one Raft cluster, and the client. The
+  LLM node is `llm_server` (the gRPC service) plus its `ollama` model backend.
+- **All inter-service traffic is gRPC** ([`proto/`](proto/)): clients ↔ app servers
+  (`AuctionService`), app server ↔ app server (`RaftService`), app servers → LLM node
+  (`LLMService`). The only HTTP hop is `llm_server → ollama`, inside the LLM node.
+- **Any app server can become leader.** Whichever wins the election accepts writes; the others
+  replicate, serve reads, and redirect writes to it.
+- **The LLM node holds no auction state** and takes no part in consensus. App servers inject the
+  facts it needs on every call.
 
-**Lifecycle of a bid:** `Login` → `ListAuctions` → `PlaceBid` (validated, compare-and-set) → the
-timer closes the auction at its end time → settlement (winner, premium, mock escrow) → the recap is
-written in the background → `GetAuctionSummary` returns all of it.
+**Lifecycle of a bid:** the client sends `PlaceBid` to the leader → the leader checks the session
+and appends a `PLACE_BID` command to its log → the entry reaches a majority and is committed →
+every node applies it (bid rules checked against the replicated state) → the leader answers the
+client. At the end time the leader's timer commits a `CLOSE_EXPIRED` command, every node closes
+and settles the auction, and the recap is committed as `SAVE_SUMMARY`.
+
+## How Raft is used here
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| Persistent state | [`raft/storage.py`](app_server/raft/storage.py) | `currentTerm`, `votedFor` and the log in SQLite, on disk before any reply |
+| The algorithm | [`raft/node.py`](app_server/raft/node.py) | roles, election timer, `RequestVote` / `AppendEntries` handlers, replication, commit, apply |
+| Node-to-node RPC | [`raft/transport.py`](app_server/raft/transport.py) | gRPC client and servicer for `RaftService` |
+| State machine | [`state_machine.py`](app_server/state_machine.py) | what each committed command does to the auction database — deterministic on every node |
+| Wiring | [`main.py`](app_server/main.py) | leader-only writes, `leader_hint` redirects, the leader-run auction timer, `GetClusterStatus` |
+
+- **The log is the source of truth.** Each node's SQLite auction database is rebuilt from the log
+  every time the node starts.
+- **Commands are deterministic.** Anything that could differ between nodes — the time, ids, a
+  salted password hash, LLM-written text, the premium percentage — is decided once by the leader
+  and carried inside the command.
+- **Writes go to the leader; reads go anywhere.** A follower answers a write with
+  `leader_hint`; a read on a follower can trail the leader by one round trip.
+- **The assignment's Raft functions** map onto [`proto/raft.proto`](proto/raft.proto) as
+  follows: `requestVote(from, to, term, lastLogIndex, lastLogTerm)` is `RequestVote`
+  (`candidate_id` = from; the RPC's target is "to"), `requestVoteReply(from, to, term,
+  voteGranted)` is `RequestVoteResponse`; `appendEntries(from, to, term, prevIndex, prevTerm,
+  commitIndex, entries)` is `AppendEntries` (`leader_id`, `prev_log_index`, `prev_log_term`,
+  `leader_commit`, `entries`), and `appendEntriesReply(from, to, term, entryAppended,
+  matchIndex)` is `AppendEntriesResponse` (`success`, `match_index`).
 
 ## Tech stack
 
 | Layer | Choice |
 | --- | --- |
-| Language | Python 3.12 — every service |
+| Language | Python 3.12 — every service, including the Raft implementation |
 | RPC | gRPC + Protocol Buffers (`grpcio 1.83.1`, `protobuf 7.36.1`) |
-| Concurrency | `asyncio` / `grpc.aio` |
-| Storage | SQLite, one database file per app-server replica |
+| Concurrency | `asyncio` / `grpc.aio` — one event loop per node, no threads in the Raft core |
+| Consensus | Raft, implemented from the paper (no consensus library) |
+| Storage | SQLite: the Raft log (fsync on every write) and a rebuilt auction database, per node |
 | LLM | Ollama serving `qwen2.5:1.5b` on CPU — no GPU required |
 | Deployment | Docker Compose |
 | Testing | `pytest 9.1.1` |
@@ -102,15 +169,19 @@ written in the background → `GetAuctionSummary` returns all of it.
 ## Repository layout
 
 ```
-proto/          gRPC contracts: auction.proto (client-facing), llm.proto (LLM node),
-                raft.proto (replica-to-replica, for Milestone 2)
-app_server/     auction node: RPC handlers, auction timer, settlement, assistant context
+proto/          gRPC contracts: auction.proto (client-facing), raft.proto (node to node),
+                llm.proto (LLM node)
+app_server/     auction node
+  raft/         Raft: storage.py (persistent state), node.py (the algorithm), transport.py (gRPC)
+  state_machine.py   the replicated commands and what applying each one does
+  main.py       RPC handlers, leader-only writes, the auction timer, startup
   store/        SQLite data access and password hashing
 llm_server/     LLM node: gRPC service, Ollama client, prompts
-client/         bidder simulation (four named personas)
+client/         bidder simulation (four named personas), leader-aware
 deploy/         docker-compose.yml - the whole system
-scripts/        seeding, guided tour, auction board, stress test, smoke tests, stub generation
-tests/          pytest: contract tests (live stack) + unit tests
+scripts/        cluster status, failover check, chaos run, consistency check, seeding,
+                guided tour, auction board, stress test, smoke tests, stub generation
+tests/          pytest: Raft and state-machine tests (no Docker), contract tests (live stack)
 ```
 
 ## Getting started
@@ -129,10 +200,10 @@ tests/          pytest: contract tests (live stack) + unit tests
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
-The first run pulls the Ollama image and downloads the ~1 GB `qwen2.5:1.5b` model into a named
-Docker volume; later runs start in seconds. The app servers and client are usable immediately, and
-the LLM node warms the model up as soon as it starts (`docker compose -f deploy/docker-compose.yml
-logs llm_server` shows `loaded and warm`).
+The three app servers elect a leader within about a second of starting. The first run also pulls
+the Ollama image and downloads the ~1 GB `qwen2.5:1.5b` model into a named Docker volume; later
+runs start in seconds. The LLM node warms the model up as soon as it starts
+(`docker compose -f deploy/docker-compose.yml logs llm_server` shows `loaded and warm`).
 
 | Service | Address on the host |
 | --- | --- |
@@ -150,51 +221,70 @@ pip install -r requirements-dev.txt
 ### 3. Check that everything is up
 
 ```bash
-python scripts/smoke_test.py          # every RPC on every node: OK / FAIL
+python scripts/cluster.py             # who is leader, each node's term, log, commit and applied index
+python scripts/smoke_test.py          # every RPC on every node, plus "exactly one leader": OK / FAIL
 python scripts/llm_smoke_test.py      # the three LLM RPCs against the real model
+```
+
+```
+ADDRESS           NODE           ROLE        TERM LEADER            LOG  COMMIT  APPLIED
+---------------------------------------------------------------------------------------
+localhost:50051   app-server-1   FOLLOWER       1 app-server-2        5       5        5
+localhost:50052   app-server-2   LEADER         1 app-server-2        5       5        5
+localhost:50053   app-server-3   FOLLOWER       1 app-server-2        5       5        5
 ```
 
 ## Demo walkthrough
 
-**Seed the demo data** — six themed auctions on every replica (listed by Tanmay and Parm):
+**Seed the demo data** — six themed auctions (listed by Tanmay and Parm), created once through the
+leader and replicated to every app server:
 
 ```bash
 python scripts/seed_demo_data.py
 ```
 
 **Watch the bidders** — four personas (Nisargh, Nahush, Karan and Mrudul), each with their own
-bidding style, bid on random open auctions on every replica every 5 seconds:
+bidding style, browse on any app server and bid through the leader every 5 seconds:
 
 ```bash
 docker compose -f deploy/docker-compose.yml logs -f client
 ```
 
-**Run the guided tour** — the whole system end to end in about 20 seconds:
+**Run the guided tour** — the whole system end to end in about 20 seconds, through the leader:
 
 ```bash
-python scripts/demo_queries.py        # add --server localhost:50052 to use another replica
+python scripts/demo_queries.py
 ```
 
 It browses the open auctions, asks the assistant about one, lists an item with no description (the
-LLM writes it), runs a short bidding war with one bid correctly rejected, and waits for the auction
-to close:
+LLM writes it), runs a short bidding war with one bid correctly rejected and the clock pushed back by
+anti-sniping, retries a bid to show it counts once, and waits for the auction to close:
 
 ```
-=== 5. Two students bid (8-second auction) ===
+=== 5. Two students bid (8-second auction, with anti-sniping) ===
   nisargh bids 120.00: accepted
   nahush bids 150.00: accepted
   nisargh bids 155.00: accepted
   nahush bids 100.00: rejected (Bid amount must be greater than current highest bid (155.0))
+  anti-sniping: bids in the closing seconds pushed the end back 2.1s - nobody wins by bidding in the last instant
+
+=== 5b. Nahush's phone loses signal and retries the same bid ===
+  sent: accepted (replayed=False)
+  retried: accepted (replayed=True) - the original outcome, not a second bid
+  bid history: 120, 150, 155, 170 - the 170 is in it once
 
 === 6. Auction closes: winner, mock escrow, recap ===
-  winner:        user_nisargh
-  final price:   155.00  (+ buyer's premium 7.75)
+  winner:        user_karan
+  final price:   220.06  (+ buyer's premium 11.00)
   escrow:        HELD (mock)
-  recap (LLM): This Raftioneer auction concluded with a final price of 155.00, which was 184% above
-  the average sale price of 54.61. ...
+  recap (LLM): ...
 ```
 
-**See the whole board** — every open auction on every replica, soonest-closing first:
+The extension buys the other bidders time to answer — in this run Karan, one of the client node's
+personas, used it to outbid both students.
+
+**See the whole board** — every open auction, soonest-closing first, with how many replicas agree
+on its highest bid:
 
 ```bash
 python scripts/board.py
@@ -208,76 +298,200 @@ python scripts/demo_queries.py        # answers, the listing and the recap now c
 docker compose -f deploy/docker-compose.yml start llm_server
 ```
 
-**Prove concurrency safety** — hundreds of simultaneous bids on one auction; the final highest bid
-must equal the highest bid the server accepted:
+**Prove concurrency safety** — hundreds of simultaneous bids on one auction through the leader; the
+final highest bid must equal the highest bid accepted, on every replica:
 
 ```bash
-python scripts/stress_bids.py                                    # 20 bidders, 400 bids
-python scripts/stress_bids.py --server localhost:50052 --bidders 50 --bids 1000
+python scripts/stress_bids.py                       # 20 bidders, 400 bids
+python scripts/stress_bids.py --bidders 50 --bids 1000
 ```
 
 **Shut down** — `docker compose -f deploy/docker-compose.yml down` (keeps the downloaded model;
-add `-v` to delete it too).
+add `-v` to delete it too). Each node's Raft log lives inside its container, so `stop`/`start`
+and `kill`/`start` keep the data and `down` starts the cluster afresh.
+
+## Fault-tolerance demo
+
+**Kill the leader mid-auction** — one command runs the whole scenario and checks every step:
+
+```bash
+python scripts/failover_check.py
+```
+
+```
+1. Bidding through the current leader
+   leader: app-server-1 at localhost:50051 (term 1)
+   auction 8846cfa0: 10 bids placed, highest 200.00, replicated to every node
+2. Killing the leader (app_server_1) with SIGKILL
+3. Waiting for the surviving nodes to elect a new leader
+   new leader: app-server-2 at localhost:50052 (term 2), 0.83s after the kill
+  PASS  the new leader was elected in a later term
+4. Checking nothing committed was lost
+  PASS  new leader reports the same highest bid (200.00)
+  PASS  a bidder's existing session still works on the new leader (sessions are replicated)
+5. Bidding continues on the new leader
+  PASS  5 more bids committed, highest now 260.00
+6. Restarting the old leader (app_server_1)
+  PASS  app-server-1 rejoined and caught up in 0.5s
+  PASS  app-server-1 is now a follower of app-server-2
+  PASS  app-server-1 reports the same final highest bid (260.00)
+PASS: leader failover lost nothing
+```
+
+Or by hand, watching the logs (every Raft line carries node, term and role):
+
+```bash
+python scripts/cluster.py                                       # find the leader
+docker compose -f deploy/docker-compose.yml kill app_server_1   # whichever is leader
+python scripts/cluster.py                                       # a new leader, in a later term
+docker compose -f deploy/docker-compose.yml start app_server_1  # rejoins as a follower and catches up
+docker compose -f deploy/docker-compose.yml logs app_server_2 | grep term=
+```
+
+**Lose the majority** — with two of three app servers down, writes are refused (nothing can be
+committed without a majority) while reads are still served; start one back and writes resume.
+
+**Run the chaos** — random faults while a bidder keeps bidding, then every check:
+
+```bash
+python scripts/chaos.py                          # 6 rounds of random faults
+python scripts/chaos.py --rounds 12 --seed 11    # replayable
+python scripts/consistency_check.py              # the end-of-run checks on their own, any time
+```
+
+```
+  round 1: killed both followers - app-server-2 was alone for 4s and could not commit, bids timed
+           out and were retried; followers restarted; stable again in 1.4s
+  round 2: cut leader app-server-2 (term 24) off the network -> app-server-1 leads term 25 after
+           1.04s; reconnected; stable again in 0.2s
+  ...
+Checking
+  PASS  one leader per term - 7 terms seen in 1511 samples
+  PASS  every replica identical: same applied digest, auctions, bids and outcomes
+  PASS  exactly once: 187 bids reported accepted, 187 in the history, none doubled, none missing
+        6 bids needed retries through the faults; 6 of those had already been applied and were
+        answered from the request table
+PASS: 12 rounds of chaos - no split brain, no divergence, every bid exactly once
+```
+
+The faults: `kill-leader` (SIGKILL), `kill-follower`, `freeze-leader` (`docker pause` — the leader
+is alive but silent, and wakes up in a stale term), `lose-majority` (both followers killed: the
+leader is alone and cannot commit), and `partition` (the leader is cut off the network while still
+running). The client node is paused only while the final checks compare replicas.
+
+> The stress test, the failover check, the chaos run and the contract tests create auctions with
+> bids far above the personas' budgets (so the simulated bidders leave them alone), and those sales
+> count towards the pricing trend in later recaps. Restart the stack (`down`, then `up`) before a
+> demo where the recaps matter.
 
 ## API overview
 
 `AuctionService` ([`proto/auction.proto`](proto/auction.proto)) — served by every app server:
 
-| RPC | Purpose |
-| --- | --- |
-| `Login` / `Logout` | Session management; first login registers the account |
-| `ListAuctions` / `GetAuction` | Browse (optionally by status) or fetch one auction |
-| `CreateAuction` | List an item; a blank description is written by the LLM |
-| `PlaceBid` | Must beat the highest bid, meet any reserve, and not be the seller's own auction |
-| `AskAssistant` | Bidder FAQ, with the auction's details as context; always answers |
-| `GetAuctionSummary` | Outcome of a closed auction: winner, premium, escrow status, recap |
+| RPC | Purpose | Who serves it |
+| --- | --- | --- |
+| `Login` / `Logout` | Session management; first login registers the account | Leader (followers redirect) |
+| `CreateAuction` | List an item; a blank description is written by the LLM | Leader (followers redirect) |
+| `PlaceBid` | Must beat the highest bid, meet any reserve, and not be the seller's own auction; an optional `request_id` makes retries safe (`replayed` marks a repeated answer) | Leader (followers redirect) |
+| `ListAuctions` / `GetAuction` | Browse (optionally by status) or fetch one auction | Any node |
+| `AskAssistant` | Bidder FAQ, with the auction's details as context; always answers | Any node |
+| `GetAuctionSummary` | Outcome of a closed auction: winner, premium, escrow status, recap | Any node |
+| `ListBids` | Every accepted bid on an auction, in the order they were accepted | Any node |
+| `GetClusterStatus` | This node's Raft role, term, leader, log progress and applied-log digest | Any node |
+
+A follower answers a write with `leader_hint` (the leader's address) instead of performing it.
+`Auction` carries both `end_time_ms` (where anti-sniping has moved it) and `original_end_time_ms`.
+
+`RaftService` ([`proto/raft.proto`](proto/raft.proto)) — between app servers only:
+`RequestVote` and `AppendEntries`, field for field as in Figure 2 of the Raft paper.
 
 `LLMService` ([`proto/llm.proto`](proto/llm.proto)) — served by the LLM node, called only by app
 servers: `GetLLMAnswer`, `GenerateItemDescription`, `SummarizeAuction`.
 
-`RaftService` ([`proto/raft.proto`](proto/raft.proto)) — `RequestVote` and `AppendEntries`,
-following Figure 2 of the Raft paper; implemented in Milestone 2.
-
 ## Design decisions
 
+- **The Raft log is the source of truth; the database is a view of it.** Rebuilding the auction
+  database from the log at every start means there is exactly one durable record to keep correct.
+- **Deterministic commands.** Followers never consult their own clock, random generator,
+  configuration or the LLM when applying an entry; the leader puts every such value in the command.
+- **Bids are judged when applied, not when received,** so simultaneous bids are decided in log
+  order — identically on every node — on top of the compare-and-set update.
+- **A new leader waits until it has applied its own no-op** before it validates any request, so it
+  never judges a request against state that is missing a committed write from the previous leader.
+- **A write that times out is reported as "may still go through".** Raft cannot tell an entry that
+  will never commit from one that will commit late; the client is told exactly that — and for bids,
+  a `request_id` makes retrying safe.
+- **Exactly-once lives in the state machine,** not the network layer: the outcome of each tagged bid
+  is replicated state, so any node that becomes leader recognises a retry, even one of a bid that a
+  previous leader accepted. Outcomes are recorded for refused bids too, so a retry always gets the
+  same answer.
+- **Anti-sniping rules are fixed at listing time** and stored with the auction, so a change of
+  leader (or a node configured differently) can never change an auction's rules mid-auction.
+- **The simulated bidders have budgets.** They stop where real bidders would, and they leave the
+  test tools' high-value auctions alone, so those tests can't be disturbed by the demo traffic.
 - **The LLM is optional infrastructure.** No bid ever waits on it; each LLM-backed feature has a
   deterministic fallback and says so (`from_fallback`, `summary_from_fallback`).
-- **Facts are computed, never inferred by the model.** The app server hands the model the auction's
-  state, the next valid bid, and the pricing trend as finished statements; a 1.5B model is fluent
-  but unreliable at arithmetic.
-- **Compare-and-set bidding.** `UPDATE … WHERE current_highest_bid < :amount` makes "no lost or
-  overwritten bids" an explicit guarantee rather than a property of the scheduler.
-- **Idempotent settlement.** The timer settles every *closed and unsettled* auction, which covers
-  both ways an auction can close (timer or late bid) and survives restarts.
-- **Additive contract changes only.** `CreateAuction`, `AskAssistant` and `GetAuctionSummary` were
-  added without changing any existing message, so older clients keep working.
+- **Facts are computed, never inferred by the model.** The model gets finished statements (the next
+  valid bid, the pricing trend); a 1.5B model is fluent but unreliable at arithmetic.
+- **Additive contract changes only.** Every RPC and field added since the contract was frozen
+  (`CreateAuction`, `AskAssistant`, `GetAuctionSummary`, `GetClusterStatus`, `ListBids`, the
+  `leader_hint`s, `request_id` / `replayed`, `original_end_time_ms`, `applied_digest`)
+  leaves existing messages unchanged, so older clients keep working.
 
 ## Testing
 
-With the system running:
+No running stack needed:
 
 ```bash
-pytest tests/                         # 59 tests, about 25 s
+pytest tests/test_raft.py tests/test_state_machine.py tests/test_assistant.py \
+       tests/test_llm_service.py tests/test_pricing_trend_db.py     # about 10 s
 ```
 
-- [`tests/test_contract.py`](tests/test_contract.py) — contract invariants against the live stack,
-  on all three replicas (e.g. a bid without a valid session is never accepted, a seller cannot bid
-  on their own auction, a closed auction reports its winner, settlement and recap, the assistant
-  always answers — LLM up or down).
-- [`tests/test_assistant.py`](tests/test_assistant.py), [`tests/test_llm_service.py`](tests/test_llm_service.py),
-  [`tests/test_pricing_trend_db.py`](tests/test_pricing_trend_db.py) — unit tests that need no running stack.
+- [`tests/test_raft.py`](tests/test_raft.py) — the Raft implementation on an in-process network
+  that can crash nodes and cut links: one leader per term, replication in order, a follower
+  redirects, leader crash and recovery, a partitioned leader's uncommitted entry is discarded, a
+  full-cluster restart recovers from disk, safety through repeated random crashes, and the
+  `RequestVote` / `AppendEntries` rules one at a time.
+- [`tests/test_state_machine.py`](tests/test_state_machine.py) — replaying the same log gives a
+  byte-identical database; bid rules, settlement and recaps are applied deterministically;
+  anti-sniping extends within the window and stops at the cap; a retried bid gets its original
+  answer and is recorded once.
 
+With the system running, the whole suite (99 tests, about 35 s):
+
+```bash
+pytest tests/
+```
+
+- [`tests/test_contract.py`](tests/test_contract.py) — contract invariants against the live stack:
+  exactly one leader, followers redirect writes, a write on the leader is visible on every node,
+  anti-sniping moves the end time identically everywhere, a retried bid is recorded once on every
+  node, nodes at the same index report the same digest, plus the Milestone 1 invariants (a bid without a valid session is never accepted, a seller cannot
+  bid on their own auction, a closed auction reports its winner, settlement and recap, the
+  assistant always answers — LLM up or down).
+
+`scripts/chaos.py`, `scripts/consistency_check.py`, `scripts/failover_check.py`,
 `scripts/stress_bids.py` and `scripts/smoke_test.py` complement the suite from the outside.
 
 ## Configuration
 
 | Variable | Service | Default | Meaning |
 | --- | --- | --- | --- |
-| `LLM_SERVER` | app servers | `llm_server:50060` | LLM node address; unset = plain-text fallbacks only |
+| `NODE_ID` | app servers | — | This node's id in the Raft cluster (`app-server-1`, …) |
+| `PEERS` | app servers | empty (one-node cluster) | The other members, `node-id=host:port,...` |
+| `SELF_ADDRESS` | app servers | `localhost:<PORT>` | How peers and clients reach this node; given out as the `leader_hint` |
+| `DATA_DIR` | app servers | `app_server/data/<NODE_ID>` | Where the Raft log and the rebuilt auction database live |
+| `RAFT_ELECTION_TIMEOUT_MIN` / `_MAX` | app servers | `0.8` / `1.6` | Election timeout range, seconds |
+| `RAFT_HEARTBEAT_SECONDS` | app servers | `0.2` | Leader heartbeat interval |
+| `RAFT_COMMIT_TIMEOUT_SECONDS` | app servers | `2.0` | How long a write waits to be committed |
+| `LLM_SERVER` | app servers | unset (compose: `llm_server:50060`) | LLM node address; unset = plain-text fallbacks only |
 | `LLM_TIMEOUT_SECONDS` | app servers | `60` | Per-call LLM deadline (CPU inference) |
-| `BUYERS_PREMIUM_PERCENT` | app servers | `5` | Mock commission added to the winning bid |
+| `BUYERS_PREMIUM_PERCENT` | app servers | `5` | Mock commission; the leader's value is written into each close command |
+| `ANTI_SNIPE_WINDOW_SECONDS` | app servers | `10` | A bid this close to the end pushes it to this long after the bid; `0` turns anti-sniping off |
+| `ANTI_SNIPE_MAX_EXTENSION_SECONDS` | app servers | `60` | How far past its original end an auction can be pushed |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | llm_server | `http://ollama:11434` / `qwen2.5:1.5b` | Model backend |
 | `OLLAMA_KEEP_ALIVE` | llm_server | `30m` | How long the model stays in memory between requests |
+| `APP_SERVERS` | client | unset (compose: the three app servers) | Where to find the cluster |
 | `BIDDER_USERNAME` / `BIDDER_PASSWORD` | client | unset | Bid as one account instead of the personas |
 
 ## Troubleshooting
@@ -287,27 +501,29 @@ pytest tests/                         # 59 tests, about 25 s
 | `ModuleNotFoundError: No module named 'auction_pb2'` | Run `./scripts/generate_protos.sh` |
 | `port is already allocated` | Stop the previous stack: `docker compose -f deploy/docker-compose.yml down` |
 | `permission denied` on the Docker socket | Add your user to the `docker` group, or use `sudo` |
+| A write fails with `Not the leader - send this to app_server_2:50051` | Expected on a follower: send writes to the leader (`scripts/cluster.py`); the bundled scripts and client do this automatically |
+| A write fails with `The cluster could not confirm this in time` | A majority of app servers is down; start them again. The write may still commit once they are back |
+| `no leader` in `scripts/cluster.py` right after a kill | An election takes about a second; run it again |
 | `llm_server` restarts or never loads the model | Give Docker at least 4 GB of memory |
 | First assistant call after stopping `llm_server` takes 15–20 s | Expected once: gRPC gives up on the missing container, then falls back instantly |
 
 ## Known limitations
 
-- **Replicas do not share state yet** — an auction created on one replica is not visible on the
-  others. This is exactly what Milestone 2 addresses.
+- **The Raft log is never compacted** (no snapshots), so a node's restart replays the whole log;
+  fine at demo scale.
+- **Reads on a follower can trail the leader** by about one round trip; reads are not linearizable.
+- **Exactly-once covers bids only.** `Login`, `Logout` and `CreateAuction` have no `request_id`;
+  a retried `CreateAuction` after a timeout can create a second listing. The request table also
+  grows forever (it would be trimmed along with the log by snapshots).
+- **Fixed membership:** the three app servers are configured up front; adding or removing a node
+  needs a restart with new `PEERS`.
+- No pre-vote or check-quorum: a node that was cut off can force one extra election when it
+  rejoins, and a leader that has lost its majority keeps believing it leads until it hears a higher
+  term (its writes time out rather than redirect).
 - The 1.5B model occasionally over-generalizes a fact; the templated fallback never does.
 - Escrow is a mock by design: nothing is charged.
 - Foreign keys are declared but not enforced, and the gRPC channels are unencrypted (fine for a
   local deployment).
-
-## Roadmap: Milestone 2
-
-- **Leader election** — `RequestVote`, randomized election timeouts, term tracking.
-- **Log replication** — `AppendEntries`; a bid is committed once a majority of replicas has it.
-- **Failure detection** — heartbeats and automatic re-election when the leader is lost.
-- **Fault-tolerance demo** — kill the leader mid-auction; no committed bid is lost.
-
-Followers will answer write requests with `accepted=false` and a `leader_hint`, a field already
-present in the contract.
 
 ## Team
 

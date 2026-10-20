@@ -5,3 +5,6 @@ __pycache__/
 *.db
 generated/
 .pytest_cache/
+
+# Raft log + rebuilt auction database of locally-run app servers
+app_server/data/

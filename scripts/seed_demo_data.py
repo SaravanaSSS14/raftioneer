@@ -23,6 +23,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, wait_until_replicated
+from narrate import aside
 
 TIMEOUT_SECONDS = 3
 
@@ -130,6 +131,8 @@ def main() -> int:
     replicated = wait_until_replicated(DEFAULT_SERVERS)
     print(f"\n{total} auction(s) created" + (", replicated to every app server." if replicated else
           " (some app servers have not caught up yet - check scripts/cluster.py)."))
+    if total and replicated:
+        aside("seed")
     return 0 if total else 1
 
 

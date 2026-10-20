@@ -21,6 +21,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import statuses
+from narrate import aside
 
 DEFAULT_SERVERS = "localhost:50051,localhost:50052,localhost:50053"
 TIMEOUT_SECONDS = 3
@@ -85,6 +86,11 @@ def main() -> int:
 
     if not rows:
         print("(no active auctions on any reachable replica - try scripts/seed_demo_data.py)")
+    elif len(by_replica) == len(servers) and all(
+        a.auction_id in seen and seen[a.auction_id].current_highest_bid == a.current_highest_bid
+        for a in rows for seen in by_replica.values()
+    ):
+        aside("board-agree")
 
     for address, code in unreachable:
         print(f"\n! {address}: unreachable ({code})")

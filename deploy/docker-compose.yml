@@ -108,6 +108,8 @@ services:
     environment:
       - NODE_ID=client
       - APP_SERVERS=app_server_1:50051,app_server_2:50051,app_server_3:50051
+      # RAFTIONEER_SERIOUS=1 docker compose ... up  -> no persona asides in the logs
+      - RAFTIONEER_SERIOUS=${RAFTIONEER_SERIOUS:-0}
     depends_on:
       - app_server_1
       - app_server_2

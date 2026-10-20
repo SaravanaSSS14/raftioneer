@@ -22,12 +22,17 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader
+from narrate import aside, heading
 
 LLM_TIMEOUT_SECONDS = 120  # model runs on CPU; app server allows up to 60s per call
 
 
-def heading(text: str) -> None:
-    print(f"\n=== {text} ===")
+def show_answer(label: str, text: str) -> None:
+    """An assistant answer, with any continuation lines (the fine print) indented."""
+    first, *rest = text.strip().split("\n")
+    print(f"  A ({label}): {first}")
+    for line in filter(None, (r.strip() for r in rest)):
+        print(f"     {line}")
 
 
 def login(stub, username: str, password: str) -> str:
@@ -70,7 +75,9 @@ def main() -> int:
                 timeout=LLM_TIMEOUT_SECONDS,
             )
             src = "plain-text fallback" if r.from_fallback else "LLM"
-            print(f"  A ({src}, {time.time() - t0:.1f}s): {r.answer if r.success else r.error_message}")
+            show_answer(f"{src}, {time.time() - t0:.1f}s", r.answer if r.success else r.error_message)
+            if r.success and not r.from_fallback:
+                aside("fine-print")
 
         heading("3. Ask a general question (no auction)")
         q = "What is the buyer's premium and when do I pay it?"
@@ -78,7 +85,7 @@ def main() -> int:
         r = stub.AskAssistant(
             auction_pb2.AskAssistantRequest(session_token=student, question=q), timeout=LLM_TIMEOUT_SECONDS
         )
-        print(f"  A ({'plain-text fallback' if r.from_fallback else 'LLM'}): {r.answer if r.success else r.error_message}")
+        show_answer("plain-text fallback" if r.from_fallback else "LLM", r.answer if r.success else r.error_message)
 
         heading("4. List an item with NO description - the LLM writes one")
         seller = login(stub, "tanmay", "tanmay123")
@@ -109,11 +116,14 @@ def main() -> int:
             )
             verdict = "accepted" if resp.accepted else f"rejected ({resp.error_message})"
             print(f"  {username} bids {amount:.2f}: {verdict}")
+            if not resp.accepted and "greater than" in resp.error_message:
+                aside("reject-low")
         item = stub.GetAuction(auction_pb2.GetAuctionRequest(auction_id=auction_id), timeout=10).auction
         extended = (item.end_time_ms - item.original_end_time_ms) / 1000
         if extended > 0:
             print(f"  anti-sniping: bids in the closing seconds pushed the end back {extended:.1f}s "
                   "- nobody wins by bidding in the last instant")
+            aside("snipe")
 
         heading("5b. Nahush's phone loses signal and retries the same bid")
         token = login(stub, "nahush", "nahush123")
@@ -129,6 +139,7 @@ def main() -> int:
             print(f"  {attempt}: {'accepted' if resp.accepted else resp.error_message} (replayed={resp.replayed}){note}")
         history = stub.ListBids(auction_pb2.ListBidsRequest(auction_id=auction_id), timeout=10).bids
         print(f"  bid history: {', '.join(f'{b.amount:.0f}' for b in history)} - the 170 is in it once")
+        aside("retry")
 
         heading("6. Auction closes: winner, mock escrow, recap")
         deadline = time.time() + 150
@@ -145,6 +156,8 @@ def main() -> int:
         print(f"  final price:   {summary.final_price:.2f}  (+ buyer's premium {summary.buyers_premium:.2f})")
         print(f"  escrow:        {summary.escrow_status}")
         print(f"  recap ({'template' if summary.summary_from_fallback else 'LLM'}): {summary.summary}")
+        if summary.summary_from_fallback:
+            aside("recap-template")
 
     print("\nDone.")
     return 0

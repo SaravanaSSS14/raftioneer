@@ -27,6 +27,8 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, statuses, wait_until_replicated
+import narrate
+from narrate import aside
 
 COMPOSE = ["docker", "compose", "-f", "deploy/docker-compose.yml"]
 TIMEOUT = 5
@@ -60,8 +62,7 @@ def node_of(address: str) -> str:
 
 
 def check(ok: bool, message: str, failures: list) -> None:
-    print(f"  {'PASS' if ok else 'FAIL'}  {message}")
-    if not ok:
+    if not narrate.check(ok, message):
         failures.append(message)
 
 
@@ -103,6 +104,7 @@ def main() -> int:
     print(f"\n2. Killing the leader ({service}) with SIGKILL")
     subprocess.run(COMPOSE + ["kill", service], check=True, capture_output=True)
     killed_at = time.time()
+    aside("kill", node=leader_node)
 
     print("\n3. Waiting for the surviving nodes to elect a new leader")
     survivors = [s for s in servers if s != leader]
@@ -111,6 +113,7 @@ def main() -> int:
     new_status = next(s for a, s in statuses([new_leader]) if s is not None)
     print(f"   new leader: {new_status.node_id} at {new_leader} (term {new_status.term}), {elapsed:.2f}s after the kill")
     check(new_status.term > term_before, "the new leader was elected in a later term", failures)
+    aside("elected", node=new_status.node_id, seconds=elapsed)
 
     print("\n4. Checking nothing committed was lost")
     after_failover = highest_bid(new_leader, auction_id)
@@ -118,6 +121,8 @@ def main() -> int:
     new_stub = stub_for(new_leader)
     accepted = bid(new_stub, bidders[0], auction_id, amount + 10)
     check(accepted, "a bidder's existing session still works on the new leader (sessions are replicated)", failures)
+    if accepted:
+        aside("sessions")
 
     print("\n5. Bidding continues on the new leader")
     amount += 10
@@ -146,9 +151,13 @@ def main() -> int:
             check(status.role == "FOLLOWER", f"{leader_node} is now a follower of {status.leader_id}", failures)
             rejoined = highest_bid(leader, auction_id)
             check(rejoined == final, f"{leader_node} reports the same final highest bid ({rejoined:.2f})", failures)
+            if status.role == "FOLLOWER":
+                aside("rejoin", node=leader_node)
 
-    print(f"\n{'PASS' if not failures else 'FAIL'}: leader failover " + (
+    narrate.verdict(not failures, "leader failover " + (
         "lost nothing" if not failures else f"- {len(failures)} check(s) failed"))
+    if not failures:
+        aside("nothing-lost")
     return 0 if not failures else 1
 
 

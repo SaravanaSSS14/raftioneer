@@ -4,6 +4,7 @@ how far its log has got. The other scripts import it to find the leader.
 
 Usage (stack up, ./scripts/generate_protos.sh already run):
     python scripts/cluster.py
+    python scripts/cluster.py --watch      # live, twice a second - keep it open while you kill the leader
     python scripts/cluster.py --servers localhost:50051,localhost:50052
 """
 import argparse
@@ -16,6 +17,7 @@ sys.path.insert(0, "generated")
 
 import auction_pb2
 import auction_pb2_grpc
+import narrate
 
 DEFAULT_SERVERS = ["localhost:50051", "localhost:50052", "localhost:50053"]
 
@@ -60,25 +62,49 @@ def wait_until_replicated(servers: list[str], timeout: float = 10.0) -> bool:
     return False
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--servers", default=",".join(DEFAULT_SERVERS), help="comma-separated app-server addresses")
-    args = parser.parse_args()
-
+def show(servers: list[str], timeout: float = 1.0) -> bool:
+    """Print the status table once. True if there is a leader."""
     print(f"{'ADDRESS':<17} {'NODE':<14} {'ROLE':<10} {'TERM':>5} {'LEADER':<14} {'LOG':>6} {'COMMIT':>7} {'APPLIED':>8}")
     print("-" * 87)
-    rows = statuses([s for s in args.servers.split(",") if s])
+    rows = statuses(servers, timeout=timeout)
     for address, s in rows:
         if s is None:
-            print(f"{address:<17} {'-':<14} {'DOWN':<10}")
+            print(f"{address:<17} {'-':<14} {narrate.role('DOWN', 10)}")
             continue
         print(
-            f"{address:<17} {s.node_id:<14} {s.role:<10} {s.term:>5} {s.leader_id or '-':<14} "
+            f"{address:<17} {s.node_id:<14} {narrate.role(s.role, 10)} {s.term:>5} {s.leader_id or '-':<14} "
             f"{s.last_log_index:>6} {s.commit_index:>7} {s.last_applied:>8}"
         )
     leaders = [s for _, s in rows if s is not None and s.role == "LEADER"]
-    print(f"\nleader: {leaders[0].node_id} (term {leaders[0].term})" if leaders else "\nno leader right now")
-    return 0 if leaders else 1
+    if leaders:
+        print(f"\nleader: {leaders[0].node_id} (term {leaders[0].term})")
+    else:
+        print("\nno leader right now")
+        narrate.aside("no-leader")
+    return bool(leaders)
+
+
+def watch(servers: list[str]) -> int:
+    """Redraw the table twice a second until Ctrl-C."""
+    try:
+        while True:
+            print("\033[H\033[2J", end="")  # clear the terminal
+            print(f"Raft cluster - {time.strftime('%H:%M:%S')}   (Ctrl-C to stop)\n")
+            show(servers, timeout=0.3)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--servers", default=",".join(DEFAULT_SERVERS), help="comma-separated app-server addresses")
+    parser.add_argument("--watch", action="store_true", help="keep redrawing the table, twice a second")
+    args = parser.parse_args()
+    servers = [s for s in args.servers.split(",") if s]
+    if args.watch:
+        return watch(servers)
+    return 0 if show(servers) else 1
 
 
 if __name__ == "__main__":

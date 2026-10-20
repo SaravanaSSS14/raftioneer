@@ -32,6 +32,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, wait_until_replicated
+import narrate
 
 
 async def run(server: str, replicas: list[str], bidders: int, bids: int) -> int:
@@ -99,9 +100,10 @@ async def run(server: str, replicas: list[str], bidders: int, bids: int) -> int:
         print("  (not every app server caught up within 10s)")
 
     if ok:
-        print("PASS: final state matches the highest accepted bid on every replica - no lost or overwritten bids")
+        narrate.verdict(True, "final state matches the highest accepted bid on every replica - no lost or overwritten bids")
+        narrate.aside("stress", bids=bids)
         return 0
-    print("FAIL: a replica's highest bid differs from the highest accepted bid")
+    narrate.verdict(False, "a replica's highest bid differs from the highest accepted bid")
     return 1
 
 

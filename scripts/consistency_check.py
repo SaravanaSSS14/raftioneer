@@ -30,6 +30,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, statuses
+import narrate
 
 TIMEOUT = 5
 
@@ -145,10 +146,11 @@ def main() -> int:
         print(f"applied index {s.last_applied}, digest {s.applied_digest[:16]}... on {len(reachable)} node(s)")
     if problems:
         for p in problems:
-            print(f"  FAIL  {p}")
-        print("FAIL: the replicas are not consistent")
+            narrate.fail(p)
+        narrate.verdict(False, "the replicas are not consistent")
         return 1
-    print("PASS: every replica holds the same state, and every auction's bids, highest bid and outcome agree")
+    narrate.verdict(True, "every replica holds the same state, and every auction's bids, highest bid and outcome agree")
+    narrate.aside("consistent")
     return 0
 
 

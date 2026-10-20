@@ -51,6 +51,8 @@ import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS
 from consistency_check import check
+import narrate
+from narrate import aside
 
 COMPOSE = ["docker", "compose", "-f", "deploy/docker-compose.yml"]
 FAULTS = ["kill-leader", "kill-follower", "freeze-leader", "lose-majority", "partition"]
@@ -284,6 +286,7 @@ async def main_async(args) -> int:
             what = await inject(fault, cluster, rng)
             settled = await cluster.wait_stable()
             print(f"  round {round_no}: {what}; stable again in {settled:.1f}s")
+            aside(fault)
         except Exception as exc:  # report and carry on; the final checks will judge the damage
             print(f"  round {round_no}: {fault} FAILED - {exc}")
             failures.append(f"round {round_no} ({fault}): {exc}")
@@ -304,13 +307,13 @@ async def main_async(args) -> int:
         doubled = {t: ids for t, ids in observer.leaders_by_term.items() if len(ids) > 1}
         if doubled:
             failures.append(f"two leaders in one term: {doubled}")
-        print(f"  {'FAIL' if doubled else 'PASS'}  one leader per term - {len(observer.leaders_by_term)} terms "
-              f"seen in {observer.samples} samples")
+        narrate.check(not doubled, f"one leader per term - {len(observer.leaders_by_term)} terms "
+                      f"seen in {observer.samples} samples")
 
         problems = await asyncio.to_thread(check, servers)
         failures += problems
-        print(f"  {'FAIL' if problems else 'PASS'}  every replica identical: same applied digest, auctions, "
-              f"bids and outcomes" + "".join(f"\n        {p}" for p in problems))
+        narrate.check(not problems, "every replica identical: same applied digest, auctions, "
+                      "bids and outcomes" + "".join(f"\n        {p}" for p in problems))
 
         leader_address, _ = await cluster.leader()
         history = (await cluster.stub(leader_address).ListBids(
@@ -322,20 +325,23 @@ async def main_async(args) -> int:
         exact = sorted(ours) == accepted and len(ours) == len(set(ours))
         if not exact:
             failures.append("bid history does not match what the chaos bidder was told")
-        print(f"  {'PASS' if exact else 'FAIL'}  exactly once: {len(accepted)} bids reported accepted, "
-              f"{len(ours)} in the history, none doubled, none missing")
-        print(f"        {chaos_bidder.retried} bids needed retries through the faults; "
+        narrate.check(exact, f"exactly once: {len(accepted)} bids reported accepted, "
+                      f"{len(ours)} in the history, none doubled, none missing")
+        retried = f"{chaos_bidder.retried} bid{'' if chaos_bidder.retried == 1 else 's'}"
+        print(f"        {retried} needed retries through the faults; "
               f"{chaos_bidder.replayed} of those had already been applied and were answered from the request table")
         if unknown or refused:
             failures.append(f"{len(unknown)} bids never got an answer, {len(refused)} were refused")
-            print(f"  FAIL  {len(unknown)} bids never got an answer, {len(refused)} refused: {list(refused.values())[:3]}")
+            narrate.fail(f"{len(unknown)} bids never got an answer, {len(refused)} refused: {list(refused.values())[:3]}")
     finally:
         if client_paused:
             await run_cmd(*COMPOSE, "unpause", "client")
 
-    print(f"\n{'PASS' if not failures else 'FAIL'}: {args.rounds} rounds of chaos" +
-          (" - no split brain, no divergence, every bid exactly once" if not failures
-           else f" - {len(failures)} problem(s)"))
+    narrate.verdict(not failures, f"{args.rounds} rounds of chaos" +
+                    (" - no split brain, no divergence, every bid exactly once" if not failures
+                     else f" - {len(failures)} problem(s)"))
+    if not failures:
+        aside("chaos-pass", rounds=args.rounds)
     return 0 if not failures else 1
 
 

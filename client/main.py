@@ -34,6 +34,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# How a persona takes being outbid - logged after the factual line, never
+# instead of it. RAFTIONEER_SERIOUS=1 keeps the logs strictly factual.
+SERIOUS = os.environ.get("RAFTIONEER_SERIOUS", "") not in ("", "0")
+OUTBID_REACTIONS = [
+    "{name} was outbid, and is now pretending the item was never that nice anyway.",
+    "{name} was outbid. {name} will be telling everyone they were 'just checking the price'.",
+    "{name} was outbid, and blames the hostel Wi-Fi.",
+    "{name} was outbid, and is recalculating the month's chai budget.",
+]
+
 # Writes (Login, PlaceBid) must go to the Raft leader; reads can go to any app
 # server. The client remembers the leader, follows a follower's leader_hint
 # when the leader changes, and asks the cluster again if the leader goes quiet.
@@ -135,6 +145,8 @@ async def run_bidder_cycle(persona: tuple) -> None:
         elif "session" in bid_resp.error_message.lower():
             _sessions.pop(username, None)  # expired or replaced: log in again next time
         log.info("%s: %s's bid rejected (%s)", leader, username, bid_resp.error_message or "no reason given")
+        if not SERIOUS and "greater than" in bid_resp.error_message:
+            log.info("  ~ %s", random.choice(OUTBID_REACTIONS).format(name=username))
 
     except grpc.aio.AioRpcError as exc:
         log.warning("app server unreachable (%s) - looking for the leader again", exc.code())

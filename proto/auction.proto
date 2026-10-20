@@ -36,8 +36,9 @@ message Auction {
   AuctionStatus status = 3;
   double current_highest_bid = 4;
   string current_highest_bidder_id = 5;
-  int64 end_time_ms = 6;
+  int64 end_time_ms = 6;      // current end time - anti-sniping can push it later
   double reserve_price = 7; // 0 = no reserve
+  int64 original_end_time_ms = 8; // the end time it was listed with; 0 if unknown
 }
 
 // ---- Auth ----
@@ -52,6 +53,7 @@ message LoginResponse {
   string session_token = 2;
   string user_id = 3;
   string error_message = 4;
+  string leader_hint = 5; // set when this node is not the Raft leader: where to retry
 }
 
 message LogoutRequest {
@@ -60,6 +62,7 @@ message LogoutRequest {
 
 message LogoutResponse {
   bool success = 1;
+  string leader_hint = 2; // set when this node is not the Raft leader: where to retry
 }
 
 // ---- Browsing ----
@@ -96,6 +99,7 @@ message CreateAuctionResponse {
   bool success = 1;
   string error_message = 2;
   string auction_id = 3;
+  string leader_hint = 4; // set when this node is not the Raft leader: where to retry
 }
 
 // ---- Assistant & post-auction results ----
@@ -137,15 +141,52 @@ message PlaceBidRequest {
   string session_token = 1;
   string auction_id = 2;
   double amount = 3;
+  // Optional, for safe retries: a client-chosen id, unique per bid. Re-sending
+  // the same id (e.g. after a timeout or a change of leader) returns the
+  // original outcome instead of placing the bid again. "" = no deduplication.
+  string request_id = 4;
 }
 
 message PlaceBidResponse {
   bool accepted = 1;
   string error_message = 2;
-  // Milestone 2: set when this node is not the Raft leader, so the client
-  // knows where to retry. Always empty in Milestone 1.
+  // Set when this node is not the Raft leader, so the client knows where to
+  // retry. Empty on the leader itself.
   string leader_hint = 3;
   Auction updated_auction = 4;
+  bool replayed = 5; // true if request_id had already been applied: this is that original outcome
+}
+
+// ---- Bid history ----
+
+message ListBidsRequest {
+  string auction_id = 1;
+}
+
+message ListBidsResponse {
+  bool found = 1;
+  repeated Bid bids = 2; // oldest first
+}
+
+// ---- Cluster status ----
+// Read-only view of one node's Raft state. Lets a client find the leader up
+// front, and lets the demo / failover scripts show what the cluster is doing.
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  string node_id = 1;
+  string role = 2;            // FOLLOWER, CANDIDATE or LEADER
+  int64 term = 3;
+  string leader_id = 4;       // "" while no leader is known
+  string leader_address = 5;  // where to send writes; "" while unknown
+  int64 commit_index = 6;
+  int64 last_applied = 7;
+  int64 last_log_index = 8;
+  // A running SHA-256 over every entry applied so far (term + command, in
+  // order). Two nodes with the same last_applied and the same digest have fed
+  // their state machines exactly the same input.
+  string applied_digest = 9;
 }
 
 service AuctionService {
@@ -155,12 +196,16 @@ service AuctionService {
   rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
   rpc CreateAuction(CreateAuctionRequest) returns (CreateAuctionResponse);
   // Must beat the highest bid and meet any reserve; sellers cannot bid on
-  // their own auctions. Milestone 1: every replica accepts bids. Milestone 2:
-  // only the Raft leader does - followers reply accepted=false with leader_hint.
+  // their own auctions. Only the Raft leader accepts writes (Login, Logout,
+  // CreateAuction, PlaceBid); a follower replies with leader_hint set instead.
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
   // Bidder FAQ, answered by the LLM node with the auction's details injected
   // as context. Never blocks or affects bidding; falls back to plain text.
   rpc AskAssistant(AskAssistantRequest) returns (AskAssistantResponse);
   // Outcome of a closed auction: winner, mock escrow settlement, recap.
   rpc GetAuctionSummary(GetAuctionSummaryRequest) returns (GetAuctionSummaryResponse);
+  // Every accepted bid on an auction, oldest first. Served by every node.
+  rpc ListBids(ListBidsRequest) returns (ListBidsResponse);
+  // This node's Raft role, term and view of the leader. Served by every node.
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
 }

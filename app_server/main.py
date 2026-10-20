@@ -1,6 +1,8 @@
 import asyncio
 import datetime
+import json
 import logging
+import math
 import os
 import uuid
 
@@ -9,12 +11,54 @@ import grpc
 import assistant
 import auction_pb2
 import auction_pb2_grpc
+import raft_pb2_grpc
+import state_machine
 from llm_client import LLMClient
+from raft import NotLeader, ProposalTimeout, RaftNode, RaftStorage
+from raft.transport import GrpcTransport, RaftServicer
 from store import database, auth
+
+
+def parse_peers(value: str) -> dict[str, str]:
+    """"app-server-2=app_server_2:50051,..." -> {"app-server-2": "app_server_2:50051", ...}"""
+    peers = {}
+    for item in filter(None, (part.strip() for part in value.split(","))):
+        node_id, _, address = item.partition("=")
+        peers[node_id] = address or node_id
+    return peers
 
 
 NODE_ID = os.environ.get("NODE_ID", "app-server-unknown")
 PORT = os.environ.get("PORT", "50051")
+
+# The other app servers in the Raft cluster. Raft RPCs share the client port.
+PEERS = parse_peers(os.environ.get("PEERS", ""))
+# How other nodes and clients reach this one; followers hand it out as the
+# leader_hint when this node is the leader.
+SELF_ADDRESS = os.environ.get("SELF_ADDRESS", f"localhost:{PORT}")
+ADDRESSES = {NODE_ID: SELF_ADDRESS, **PEERS}
+
+# Where this node keeps its Raft log and its copy of the auction database.
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", NODE_ID))
+
+# Raft timing. A follower that hears nothing from a leader for a random time
+# in [min, max] starts an election; the leader sends heartbeats well inside
+# the minimum, so a healthy leader is never suspected.
+ELECTION_TIMEOUT = (
+    float(os.environ.get("RAFT_ELECTION_TIMEOUT_MIN", "0.8")),
+    float(os.environ.get("RAFT_ELECTION_TIMEOUT_MAX", "1.6")),
+)
+HEARTBEAT_SECONDS = float(os.environ.get("RAFT_HEARTBEAT_SECONDS", "0.2"))
+# How long a write waits to be committed before the client is told it failed.
+COMMIT_TIMEOUT_SECONDS = float(os.environ.get("RAFT_COMMIT_TIMEOUT_SECONDS", "2.0"))
+
+# Anti-sniping, applied to auctions as they are listed: a bid in the last
+# WINDOW seconds pushes the end to WINDOW seconds after that bid, never more
+# than MAX_EXTENSION seconds past the original end. WINDOW=0 turns it off.
+ANTI_SNIPE_WINDOW_SECONDS = int(os.environ.get("ANTI_SNIPE_WINDOW_SECONDS", "10"))
+ANTI_SNIPE_MAX_EXTENSION_SECONDS = int(os.environ.get("ANTI_SNIPE_MAX_EXTENSION_SECONDS", "60"))
+
+MAX_REQUEST_ID_LENGTH = 64
 
 # The LLM node is optional infrastructure: if it isn't configured, or is slow
 # or down, every LLM-backed feature falls back to plain text and bidding is
@@ -22,13 +66,19 @@ PORT = os.environ.get("PORT", "50051")
 LLM_SERVER = os.environ.get("LLM_SERVER", "")
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
 
-# Milestone 1 has no leader election - every replica accepts writes - so there
-# is no leader to point a client at. The field stays in the contract for when
-# followers need to redirect writes (Milestone 2).
-LEADER_HINT = ""
+MAX_AUCTION_SECONDS = 30 * 24 * 3600
+
+COMMIT_TIMEOUT_MESSAGE = (
+    "The cluster could not confirm this in time (is a majority of servers down?). "
+    "It may still go through - check before retrying."
+)
 
 logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [%(levelname)s] node={NODE_ID} %(message)s")
 log = logging.getLogger(__name__)
+
+
+def now_ms() -> int:
+    return int(datetime.datetime.now().timestamp() * 1000)
 
 
 def auction_to_proto(record: dict) -> auction_pb2.Auction:
@@ -45,14 +95,51 @@ def auction_to_proto(record: dict) -> auction_pb2.Auction:
         current_highest_bidder_id=record["current_highest_bidder_id"] or "",
         end_time_ms=int(record["end_time_ms"]),
         reserve_price=float(record.get("reserve_price") or 0.0),
+        original_end_time_ms=int(record.get("original_end_ms") or 0),
     )
 
 
 class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
-    """The auction service: auth, listings, bidding, and the assistant."""
+    """The auction service: auth, listings, bidding, and the assistant.
 
-    def __init__(self, llm: LLMClient | None = None):
+    Writes (Login, Logout, CreateAuction, PlaceBid) go through Raft: only the
+    leader accepts them, turns each into a command in the replicated log, and
+    answers once a majority has stored it and it has been applied. A follower
+    answers a write with leader_hint instead. Reads are served by any node
+    from its own copy of the state, which may trail the leader's by a
+    heartbeat or so.
+    """
+
+    def __init__(self, node: RaftNode, llm: LLMClient | None = None):
+        self.node = node
         self.llm = llm
+
+    # ---- Raft plumbing shared by the write RPCs ----
+
+    def _leader_hint(self) -> str:
+        return ADDRESSES.get(self.node.leader_id or "", "")
+
+    def _not_leader_message(self) -> str:
+        hint = self._leader_hint()
+        if hint:
+            return f"Not the leader - send this to {hint}"
+        return "No leader elected right now - please retry in a moment"
+
+    async def _leader_ready(self) -> None:
+        """Raise NotLeader unless this node is the leader and its state is
+        caught up with everything committed before its term."""
+        await self.node.wait_until_ready(COMMIT_TIMEOUT_SECONDS)
+
+    async def _commit(self, op: str, **fields) -> dict:
+        """Replicate one command and return its result once it is applied."""
+        result = await self.node.propose(
+            state_machine.encode(op, now_ms=now_ms(), **fields), timeout=COMMIT_TIMEOUT_SECONDS
+        )
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    # ---- Auth ----
 
     async def Login(self, request, context):
         """Log in, registering the username on first use.
@@ -72,45 +159,72 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                     session_token="", user_id=""
                 )
 
+            await self._leader_ready()
             existing_user = database.get_user(username)
 
+            # Password hashing is deliberately slow (PBKDF2); run it off the
+            # event loop so a burst of logins can't delay Raft heartbeats long
+            # enough for followers to think the leader has died.
             if existing_user is None:
                 user_id = f"user_{username}"
-                database.create_user(username, user_id, auth.hash_password(password))
-                log.info("Registered new user %s", username)
+                password_hash = await asyncio.to_thread(auth.hash_password, password)
             else:
-                if not auth.validate_password_stored(password, existing_user["password_hash"]):
+                matches = await asyncio.to_thread(
+                    auth.validate_password_stored, password, existing_user["password_hash"]
+                )
+                if not matches:
                     log.info("Login rejected - wrong password for %s", username)
                     return auction_pb2.LoginResponse(
                         success=False, error_message="Invalid username or password",
                         session_token="", user_id=""
                     )
                 user_id = existing_user["user_id"]
+                password_hash = ""  # existing user: nothing to register
 
             session_token = auth.generate_session_token()
-            database.create_session(session_token, user_id, username)
+            result = await self._commit(
+                "LOGIN", username=username, user_id=user_id, password_hash=password_hash, session_token=session_token
+            )
+            if not result["ok"]:
+                log.info("Login rejected for %s (%s)", username, result["error"])
+                return auction_pb2.LoginResponse(success=False, error_message=result["error"])
 
             return auction_pb2.LoginResponse(
                 success=True, session_token=session_token, user_id=user_id, error_message=""
             )
 
+        except NotLeader:
+            return auction_pb2.LoginResponse(
+                success=False, error_message=self._not_leader_message(), leader_hint=self._leader_hint()
+            )
+        except ProposalTimeout:
+            return auction_pb2.LoginResponse(success=False, error_message=COMMIT_TIMEOUT_MESSAGE)
         except Exception:
             log.exception("Login failed for %s", request.username)
             return auction_pb2.LoginResponse(success=False, error_message="Login failed, please try again")
 
     async def Logout(self, request, context):
-        """End a session. Always succeeds for an unknown or empty token."""
+        """End a session. An empty token is a no-op on any node; otherwise this
+        is a write, so it needs the leader. Succeeds for an unknown token."""
         try:
-            if request.session_token:
-                session = database.validate_session(request.session_token)
-                database.delete_session(request.session_token)
-                if session:
-                    log.info("Logged out %s", session["username"])
+            if not request.session_token:
+                return auction_pb2.LogoutResponse(success=True)
+            await self._leader_ready()
+            session = database.validate_session(request.session_token)
+            if session:
+                await self._commit("LOGOUT", session_token=request.session_token)
+                log.info("Logged out %s", session["username"])
             return auction_pb2.LogoutResponse(success=True)
 
+        except NotLeader:
+            return auction_pb2.LogoutResponse(success=False, leader_hint=self._leader_hint())
+        except ProposalTimeout:
+            return auction_pb2.LogoutResponse(success=False)
         except Exception:
             log.exception("Logout failed")
             return auction_pb2.LogoutResponse(success=False)
+
+    # ---- Browsing (served by any node) ----
 
     async def ListAuctions(self, request, context):
         """All auctions, optionally filtered by status."""
@@ -140,13 +254,18 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             log.exception("GetAuction failed for %s", request.auction_id)
             return auction_pb2.GetAuctionResponse(found=False)
 
+    # ---- Writes ----
+
     async def CreateAuction(self, request, context):
         """List an item as an immediately-active auction.
 
         Session-gated - any logged-in user may sell - rather than a separate
-        seller role. A blank description is written by the LLM node.
+        seller role. A blank description is written by the LLM node (before
+        the command is proposed: the log carries the finished text, so every
+        node stores the same description).
         """
         try:
+            await self._leader_ready()
             session = database.validate_session(request.session_token)
             if not session:
                 return auction_pb2.CreateAuctionResponse(
@@ -155,6 +274,12 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
 
             if not request.title.strip():
                 return auction_pb2.CreateAuctionResponse(success=False, error_message="Title is required")
+            if not math.isfinite(request.reserve_price) or request.reserve_price < 0:
+                return auction_pb2.CreateAuctionResponse(
+                    success=False, error_message="Reserve price must be zero or a positive number"
+                )
+            if request.duration_seconds > MAX_AUCTION_SECONDS:
+                return auction_pb2.CreateAuctionResponse(success=False, error_message="An auction can run for at most 30 days")
 
             duration_seconds = request.duration_seconds if request.duration_seconds > 0 else 3600
             auction_id = str(uuid.uuid4())[:8]
@@ -163,64 +288,140 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             if not description:
                 description = await self._describe_item(request.title)
 
-            created = database.create_item(
-                item_id=auction_id,
+            result = await self._commit(
+                "CREATE_AUCTION",
+                auction_id=auction_id,
                 title=request.title,
                 description=description,
                 seller_id=session["user_id"],
                 duration_seconds=duration_seconds,
                 reserve_price=request.reserve_price,
+                snipe_window_seconds=ANTI_SNIPE_WINDOW_SECONDS,
+                max_extension_seconds=ANTI_SNIPE_MAX_EXTENSION_SECONDS,
             )
-            if not created:
+            if not result["ok"]:
                 return auction_pb2.CreateAuctionResponse(success=False, error_message="Could not create auction")
 
-            log.info("CreateAuction(auction_id=%s, title=%s) by %s", auction_id, request.title, session["user_id"])
             return auction_pb2.CreateAuctionResponse(success=True, auction_id=auction_id)
 
+        except NotLeader:
+            return auction_pb2.CreateAuctionResponse(
+                success=False, error_message=self._not_leader_message(), leader_hint=self._leader_hint()
+            )
+        except ProposalTimeout:
+            return auction_pb2.CreateAuctionResponse(success=False, error_message=COMMIT_TIMEOUT_MESSAGE)
         except Exception:
             log.exception("CreateAuction failed")
             return auction_pb2.CreateAuctionResponse(success=False, error_message="Could not create auction, please try again")
 
     async def PlaceBid(self, request, context):
-        """Place a bid: it must beat the highest bid and meet any reserve."""
+        """Place a bid: it must beat the highest bid and meet any reserve.
+
+        Bids are judged when they are applied from the log, so simultaneous
+        bids are decided in log order - identically on every node. A bid that
+        carries a request_id is exactly-once: a retry gets the original outcome
+        (replayed=True) instead of being placed again.
+        """
         try:
+            await self._leader_ready()
             session = database.validate_session(request.session_token)
             if not session:
                 return auction_pb2.PlaceBidResponse(
                     accepted=False,
                     error_message="Invalid or expired session token",
-                    leader_hint=LEADER_HINT,
                     updated_auction=auction_pb2.Auction()
                 )
+            if len(request.request_id) > MAX_REQUEST_ID_LENGTH:
+                return auction_pb2.PlaceBidResponse(
+                    accepted=False, error_message="request_id is too long", updated_auction=auction_pb2.Auction()
+                )
 
-            successful, result = database.create_bid(
-                auction_id=request.auction_id,
-                bidder_id=session["user_id"],
-                amount=request.amount
+            # A retry of a request already applied is answered straight from
+            # the request table, without a new log entry (paper, section 8).
+            # One still in flight is caught when its duplicate is applied.
+            stored = (
+                database.get_request_result(session["user_id"], request.request_id) if request.request_id else None
             )
-            if not successful:
+            if stored is not None:
+                result = {**json.loads(stored), "replayed": True}
+            else:
+                result = await self._commit(
+                    "PLACE_BID",
+                    bid_id=str(uuid.uuid4())[:8],
+                    auction_id=request.auction_id,
+                    bidder_id=session["user_id"],
+                    amount=request.amount,
+                    request_id=request.request_id,
+                )
+            replayed = bool(result.get("replayed"))
+            if not result["ok"]:
                 return auction_pb2.PlaceBidResponse(
                     accepted=False,
-                    error_message=result,
-                    leader_hint=LEADER_HINT,
-                    updated_auction=auction_pb2.Auction()
+                    error_message=result["message"],
+                    updated_auction=auction_pb2.Auction(),
+                    replayed=replayed,
                 )
 
             return auction_pb2.PlaceBidResponse(
                 accepted=True,
                 error_message="",
-                leader_hint=LEADER_HINT,
                 updated_auction=auction_to_proto(database.get_auction(request.auction_id)),
+                replayed=replayed,
             )
 
+        except NotLeader:
+            return auction_pb2.PlaceBidResponse(
+                accepted=False,
+                error_message=self._not_leader_message(),
+                leader_hint=self._leader_hint(),
+                updated_auction=auction_pb2.Auction()
+            )
+        except ProposalTimeout:
+            return auction_pb2.PlaceBidResponse(
+                accepted=False, error_message=COMMIT_TIMEOUT_MESSAGE, updated_auction=auction_pb2.Auction()
+            )
         except Exception:
             log.exception("PlaceBid failed for %s", request.auction_id)
             return auction_pb2.PlaceBidResponse(
                 accepted=False,
                 error_message="Could not place bid, please try again",
-                leader_hint=LEADER_HINT,
                 updated_auction=auction_pb2.Auction()
             )
+
+    async def ListBids(self, request, context):
+        """Every accepted bid on an auction, oldest first."""
+        try:
+            if not database.get_auction(request.auction_id):
+                return auction_pb2.ListBidsResponse(found=False)
+            return auction_pb2.ListBidsResponse(
+                found=True,
+                bids=[
+                    auction_pb2.Bid(
+                        bid_id=b["bid_id"], auction_id=b["auction_id"], bidder_id=b["bidder_id"],
+                        amount=float(b["amount"]), timestamp_ms=int(b["timestamp_ms"]),
+                    )
+                    for b in database.get_bids_for_auction(request.auction_id)
+                ],
+            )
+        except Exception:
+            log.exception("ListBids failed for %s", request.auction_id)
+            return auction_pb2.ListBidsResponse(found=False)
+
+    # ---- Cluster status ----
+
+    async def GetClusterStatus(self, request, context):
+        status = self.node.status()
+        return auction_pb2.ClusterStatusResponse(
+            node_id=status["node_id"],
+            role=status["role"],
+            term=status["term"],
+            leader_id=status["leader_id"],
+            leader_address=self._leader_hint(),
+            commit_index=status["commit_index"],
+            last_applied=status["last_applied"],
+            last_log_index=status["last_log_index"],
+            applied_digest=status["applied_digest"],
+        )
 
     # ------------------------------------------------------------------
     # LLM-backed features. None of these sit on the bidding path, and every
@@ -258,17 +459,17 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                     return auction_pb2.AskAssistantResponse(success=False, error_message="Auction not found")
                 bid_count = len(database.get_bids_for_auction(request.auction_id))
 
-            now_ms = datetime.datetime.now().timestamp() * 1000
+            now = now_ms()
 
             if self.llm is not None:
                 try:
-                    answer = await self.llm.get_answer(question, assistant.build_context(auction, bid_count, now_ms))
+                    answer = await self.llm.get_answer(question, assistant.build_context(auction, bid_count, now))
                     return auction_pb2.AskAssistantResponse(success=True, answer=answer, from_fallback=False)
                 except grpc.aio.AioRpcError as exc:
                     log.warning("LLM node unavailable for AskAssistant (%s) - answering from facts", exc.code())
 
             return auction_pb2.AskAssistantResponse(
-                success=True, answer=assistant.fallback_answer(auction, bid_count, now_ms), from_fallback=True
+                success=True, answer=assistant.fallback_answer(auction, bid_count, now), from_fallback=True
             )
 
         except Exception:
@@ -314,108 +515,123 @@ TIMER_TICK_SECONDS = 1
 _background_tasks: set = set()
 
 
-def settle_auction(record: dict) -> dict:
-    """Mock escrow settlement for a closed auction. Nothing is charged: it
-    records what a real payment step would hold, and logs it."""
-    winner_id = record["current_highest_bidder_id"] or None
-    final_price = float(record["current_highest_bid"]) if winner_id else 0.0
-    premium, escrow_status = assistant.compute_settlement(final_price, winner_id is not None)
-
-    database.create_settlement(
-        record["auction_id"], winner_id, record["seller_id"], final_price, premium, escrow_status
-    )
-
-    if winner_id:
-        log.info(
-            "settlement auction=%s: %s escrowed for %s (%s + %s buyer's premium) -> released to %s once handed over [mock]",
-            record["auction_id"], assistant.money(final_price + premium), winner_id,
-            assistant.money(final_price), assistant.money(premium), record["seller_id"],
-        )
-    else:
-        log.info("settlement auction=%s: no sale, nothing escrowed", record["auction_id"])
-
-    return {"winner_id": winner_id, "final_price": final_price}
-
-
-async def summarize_auction(llm: LLMClient | None, record: dict, settlement: dict) -> None:
-    """Write the post-auction recap: the LLM node if it answers, a templated
-    one if it doesn't. Runs in the background so a slow model never delays
-    the timer or anything else."""
+async def write_recap(node: RaftNode, llm: LLMClient | None, record: dict) -> None:
+    """Write the post-auction recap - the LLM node if it answers, a templated
+    one if it doesn't - and commit it through Raft so every node stores the
+    same text. Runs in the background so a slow model never delays the timer."""
     auction_id = record["auction_id"]
     try:
+        winner_id = record["winner_id"]
+        final_price = float(record["final_price"])
         amounts = [float(b["amount"]) for b in database.get_bids_for_auction(auction_id)]
         average_price = database.get_average_sale_price(exclude_auction_id=auction_id)
         text, from_fallback = None, True
 
         if llm is not None:
             try:
-                text = await llm.summarize_auction(
-                    auction_id, record["title"], amounts, settlement["final_price"], average_price
-                )
+                text = await llm.summarize_auction(auction_id, record["title"], amounts, final_price, average_price)
                 from_fallback = False
             except grpc.aio.AioRpcError as exc:
                 log.warning("LLM node unavailable for the recap of %s (%s) - using template", auction_id, exc.code())
 
         if text is None:
-            winner = settlement["winner_id"].removeprefix("user_") if settlement["winner_id"] else None
-            text = assistant.fallback_summary(record["title"], amounts, settlement["final_price"], winner, average_price)
+            winner = winner_id.removeprefix("user_") if winner_id else None
+            text = assistant.fallback_summary(record["title"], amounts, final_price, winner, average_price)
 
-        database.save_summary(auction_id, text, from_fallback)
+        await node.propose(
+            state_machine.encode(
+                "SAVE_SUMMARY", auction_id=auction_id, summary=text, from_fallback=from_fallback, now_ms=now_ms()
+            ),
+            timeout=COMMIT_TIMEOUT_SECONDS,
+        )
         log.info("recap auction=%s (%s): %s", auction_id, "template" if from_fallback else "LLM", text)
+    except (NotLeader, ProposalTimeout):
+        log.info("recap for %s not committed (leadership changed) - the next leader will write it", auction_id)
     except Exception:
         log.exception("could not write the recap for auction %s", auction_id)
 
 
-async def run_auction_timer(llm: LLMClient | None = None):
-    """Close auctions whose clock has run out, then settle every closed auction
-    that has no settlement yet (winner + mock escrow) and start its recap.
+async def run_auction_timer(node: RaftNode, llm: LLMClient | None = None):
+    """The auction clock, run by whichever node is currently the leader.
 
-    Settling "closed and unsettled", rather than only what this tick closed,
-    also covers an auction closed by a late bid (see database.create_bid) and
-    survives a restart. Timer state is local to this replica in Milestone 1.
+    Once a second the leader checks for auctions past their end time (or
+    closed but unsettled), and if there are any it proposes one CLOSE_EXPIRED
+    command stamped with its clock; every node then closes and settles the
+    same auctions when it applies that command. It also starts a recap for
+    each settled auction that doesn't have one yet.
+
+    Because the decision is a log entry and not local process state, a leader
+    crash loses nothing: the next leader sees the same auctions still open (or
+    unsettled, or un-recapped) and finishes the job.
     """
+    recaps_in_progress: set[str] = set()
     while True:
+        await asyncio.sleep(TIMER_TICK_SECONDS)
+        if not node.is_leader:
+            continue
         try:
-            now_ms = int(datetime.datetime.now().timestamp() * 1000)
-            for record in database.close_expired_auctions(now_ms):
-                if record["current_highest_bidder_id"]:
-                    log.info(
-                        "auction %s closed - winner=%s amount=%s (item=%s)",
-                        record["auction_id"], record["current_highest_bidder_id"],
-                        record["current_highest_bid"], record["title"],
-                    )
-                else:
-                    log.info("auction %s closed - no bids placed (item=%s)", record["auction_id"], record["title"])
+            await node.wait_until_ready(COMMIT_TIMEOUT_SECONDS)
+            now = now_ms()
+            if database.has_expired_active(now) or database.get_closed_unsettled():
+                command = state_machine.encode(
+                    "CLOSE_EXPIRED", now_ms=now, premium_percent=assistant.BUYERS_PREMIUM_PERCENT
+                )
+                await node.propose(command, timeout=COMMIT_TIMEOUT_SECONDS)
 
-            for record in database.get_closed_unsettled():
-                settlement = settle_auction(record)
-                task = asyncio.create_task(summarize_auction(llm, record, settlement))
+            for record in database.get_unsummarized():
+                auction_id = record["auction_id"]
+                if auction_id in recaps_in_progress:
+                    continue
+                recaps_in_progress.add(auction_id)
+                task = asyncio.create_task(write_recap(node, llm, record))
                 _background_tasks.add(task)
                 task.add_done_callback(_background_tasks.discard)
+                task.add_done_callback(lambda _t, aid=auction_id: recaps_in_progress.discard(aid))
+        except (NotLeader, ProposalTimeout):
+            pass  # lost leadership or quorum mid-tick; the next leader carries on
         except Exception:
             # One bad tick must never kill the timer for the life of the process.
             log.exception("auction timer tick failed")
-        await asyncio.sleep(TIMER_TICK_SECONDS)
 
 
 async def serve():
-    """Start the gRPC server and the auction timer."""
-    database.init_database()
+    """Start the Raft node, the gRPC server (auction + Raft services on one
+    port) and the auction timer."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # The auction database is a cache of the replicated log: start it empty and
+    # let Raft re-apply every committed entry into it. The log itself (raft.db)
+    # is what survives a restart.
+    database.DB_PATH = os.path.join(DATA_DIR, "auctions.db")
+    database.DURABLE = False
+    database.reset_database()
+
+    storage = RaftStorage(os.path.join(DATA_DIR, "raft.db"))
+    transport = GrpcTransport(PEERS)
+    node = RaftNode(
+        NODE_ID, list(PEERS), storage, transport, state_machine.apply,
+        election_timeout=ELECTION_TIMEOUT, heartbeat_interval=HEARTBEAT_SECONDS,
+    )
 
     llm = LLMClient(LLM_SERVER, timeout_seconds=LLM_TIMEOUT_SECONDS) if LLM_SERVER else None
     log.info("LLM node: %s", LLM_SERVER or "not configured (assistant features use plain-text fallbacks)")
 
     server = grpc.aio.server()
-    auction_pb2_grpc.add_AuctionServiceServicer_to_server(AuctionServiceServicer(llm), server)
+    auction_pb2_grpc.add_AuctionServiceServicer_to_server(AuctionServiceServicer(node, llm), server)
+    raft_pb2_grpc.add_RaftServiceServicer_to_server(RaftServicer(node), server)
     server.add_insecure_port(f"[::]:{PORT}")
-    log.info("app server starting on port %s", PORT)
+    log.info("app server starting on port %s (peers: %s)", PORT, PEERS or "none - single-node cluster")
     await server.start()
 
-    timer_task = asyncio.create_task(run_auction_timer(llm))
+    node.start()
+    timer_task = asyncio.create_task(run_auction_timer(node, llm))
     try:
         await server.wait_for_termination()
     finally:
         timer_task.cancel()
+        await node.stop()
+        await transport.close()
+        storage.close()
         if llm is not None:
             await llm.close()
 

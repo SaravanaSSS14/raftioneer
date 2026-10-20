@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import os
 import uuid
@@ -10,12 +11,33 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "auctions.db")
 
+# Under Raft this database is not the source of truth: it is rebuilt from the
+# replicated log every time the node starts (see main.py), so main.py turns
+# off the per-commit fsync for speed. Used on its own (the unit tests), it
+# stays fully durable.
+DURABLE = True
+
 
 def get_connection() -> sqlite3.Connection:
     """A new connection per call, with rows readable by column name."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    if not DURABLE:
+        conn.execute("PRAGMA synchronous = OFF")
     return conn
+
+
+def _now_ms() -> int:
+    return int(datetime.now().timestamp() * 1000)
+
+
+def reset_database() -> None:
+    """Start from empty tables. Called at startup under Raft, before the log
+    is replayed into the database."""
+    for path in (DB_PATH, DB_PATH + "-journal"):
+        if os.path.exists(path):
+            os.remove(path)
+    init_database()
 
 
 def init_database():
@@ -57,7 +79,12 @@ def init_database():
                 current_highest_bid REAL NOT NULL DEFAULT 0.0,
                 current_highest_bidder_id TEXT,
                 end_time_ms INTEGER NOT NULL,
-                reserve_price REAL DEFAULT 0.0
+                reserve_price REAL DEFAULT 0.0,
+                -- anti-sniping: fixed when the auction is listed, so the rules
+                -- can't change mid-auction (e.g. when the leader changes)
+                original_end_ms INTEGER,
+                snipe_window_ms INTEGER NOT NULL DEFAULT 0,
+                max_end_ms INTEGER
             )
         """)
         
@@ -98,6 +125,18 @@ def init_database():
             )
         """)
 
+        # Exactly-once bids: the outcome of every PlaceBid that carried a
+        # request id, so a retry of the same request gets the same answer
+        # instead of being applied a second time. Scoped per bidder.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS applied_requests (
+                bidder_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                result TEXT NOT NULL,
+                PRIMARY KEY (bidder_id, request_id)
+            )
+        """)
+
         # The recap written after an auction closes (by the LLM node, or a
         # templated fallback if it was unreachable).
         conn.execute("""
@@ -128,12 +167,12 @@ def get_user(username: str) -> Optional[dict]:
         conn.close()
 
 
-def create_user(username: str, user_id: str, password_hash: str) -> bool:
+def create_user(username: str, user_id: str, password_hash: str, now_ms: Optional[int] = None) -> bool:
     """Register a new user with a hashed password. Returns False if
     the username or user_id already exists."""
     conn = get_connection()
     try:
-        now_ms = datetime.now().timestamp() * 1000
+        now_ms = now_ms if now_ms is not None else _now_ms()
         conn.execute("""
             INSERT INTO users (username, user_id, password_hash, created_at)
             VALUES (?, ?, ?, ?)
@@ -149,11 +188,11 @@ def create_user(username: str, user_id: str, password_hash: str) -> bool:
 SESSION_TTL_MS = 3_600_000  # one hour
 
 
-def create_session(session_token: str, user_id: str, username: str) -> None:
+def create_session(session_token: str, user_id: str, username: str, now_ms: Optional[int] = None) -> None:
     """Start a session, replacing the user's previous one (one per user)."""
     conn = get_connection()
     try:
-        now_ms = datetime.now().timestamp() * 1000
+        now_ms = now_ms if now_ms is not None else _now_ms()
         conn.execute("""
             INSERT OR REPLACE INTO sessions (session_token, user_id, username, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?)
@@ -230,8 +269,15 @@ def get_auction(auction_id: str) -> Optional[dict]:
 
 
 def create_item(item_id: str, title: str, description: str, seller_id: str,
-                 duration_seconds: int = 3600, reserve_price: float = 0.0) -> bool:
-    """Create a new item and an immediately-active auction for it."""
+                 duration_seconds: int = 3600, reserve_price: float = 0.0,
+                 now_ms: Optional[int] = None, snipe_window_seconds: int = 0,
+                 max_extension_seconds: int = 0) -> bool:
+    """Create a new item and an immediately-active auction for it.
+
+    Anti-sniping (off when snipe_window_seconds is 0): a bid accepted in the
+    last snipe_window_seconds moves the end time to snipe_window_seconds after
+    that bid, but never more than max_extension_seconds past the original end.
+    """
     conn = get_connection()
     try:
         existing = conn.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
@@ -242,13 +288,15 @@ def create_item(item_id: str, title: str, description: str, seller_id: str,
                 VALUES (?, ?, ?, ?)
             """, (item_id, title, description, seller_id))
 
-            now_ms = datetime.now().timestamp() * 1000
+            now_ms = now_ms if now_ms is not None else _now_ms()
             end_time_ms = now_ms + duration_seconds * 1000
             conn.execute("""
                 INSERT INTO auctions (auction_id, item_id, title, description, seller_id,
-                                     status, current_highest_bid, current_highest_bidder_id, end_time_ms, reserve_price)
-                VALUES (?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?, ?, ?)
-            """, (item_id, item_id, title, description, seller_id, None, end_time_ms, reserve_price))
+                                     status, current_highest_bid, current_highest_bidder_id, end_time_ms, reserve_price,
+                                     original_end_ms, snipe_window_ms, max_end_ms)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE', 0.0, ?, ?, ?, ?, ?, ?)
+            """, (item_id, item_id, title, description, seller_id, None, end_time_ms, reserve_price,
+                  end_time_ms, snipe_window_seconds * 1000, end_time_ms + max_extension_seconds * 1000))
 
         conn.commit()
         return True
@@ -258,8 +306,12 @@ def create_item(item_id: str, title: str, description: str, seller_id: str,
         conn.close()
 
 
-def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, str]:
+def create_bid(auction_id: str, bidder_id: str, amount: float,
+               now_ms: Optional[int] = None, bid_id: Optional[str] = None) -> tuple[bool, str]:
     """Record a bid if it is valid. Returns (accepted, bid_id or the reason it was refused).
+
+    Under Raft the time and bid id come from the replicated command, so every
+    node reaches the same verdict on the same bid.
 
     The highest bid is only ever raised by a compare-and-set UPDATE ("set it to X
     where it is still below X"), so bids racing for the same auction can never let
@@ -267,7 +319,7 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
     """
     conn = get_connection()
     try:
-        now_ms = datetime.now().timestamp() * 1000
+        now_ms = now_ms if now_ms is not None else _now_ms()
         row = conn.execute("SELECT * FROM auctions WHERE auction_id = ?", (auction_id,)).fetchone()
         if not row:
             return False, "Auction not found"
@@ -284,6 +336,11 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
 
         if auction["seller_id"] == bidder_id:
             return False, "Sellers cannot bid on their own auction"
+
+        # NaN compares false with everything and +inf beats every bid, so either
+        # would slip through the checks below; inf would win any auction outright.
+        if not math.isfinite(amount) or amount <= 0:
+            return False, "Bid amount must be a positive number"
 
         current_bid = auction["current_highest_bid"] or 0.0
         if amount <= current_bid:
@@ -305,7 +362,17 @@ def create_bid(auction_id: str, bidder_id: str, amount: float) -> tuple[bool, st
                 return False, f"Auction is {latest['status']}, cannot place bid"
             return False, f"Bid amount must be greater than current highest bid ({latest['current_highest_bid']})"
 
-        bid_id = str(uuid.uuid4())[:8]
+        # Anti-sniping: a bid in the closing window buys everyone else time to
+        # answer it - the end moves to one full window after this bid, up to
+        # the auction's cap. It's part of applying the bid, so every node moves
+        # the clock identically (now_ms is the leader's, from the command).
+        window = auction.get("snipe_window_ms") or 0
+        if window and auction["end_time_ms"] - now_ms <= window:
+            new_end = min(now_ms + window, auction["max_end_ms"] or auction["end_time_ms"])
+            if new_end > auction["end_time_ms"]:
+                conn.execute("UPDATE auctions SET end_time_ms = ? WHERE auction_id = ?", (new_end, auction_id))
+
+        bid_id = bid_id or str(uuid.uuid4())[:8]
         conn.execute("""
             INSERT INTO bids (bid_id, auction_id, bidder_id, amount, timestamp_ms)
             VALUES (?, ?, ?, ?, ?)
@@ -348,8 +415,26 @@ def close_expired_auctions(now_ms: int) -> list[dict]:
         conn.close()
 
 
+def has_expired_active(now_ms: int) -> bool:
+    """Is any ACTIVE auction past its end time? The leader checks this before
+    proposing a close, so an idle cluster doesn't fill its log with no-ops."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM auctions WHERE status = 'ACTIVE' AND end_time_ms <= ? LIMIT 1", (now_ms,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def get_bids_for_auction(auction_id: str) -> list[dict]:
-    """All bids on an auction, oldest first, with the bidder's username.
+    """All bids on an auction in the order they were accepted, with the
+    bidder's username.
+
+    Ordered by rowid - the order the bids were applied from the Raft log,
+    identical on every node - rather than by timestamp, which a clock
+    adjustment on the leader could reorder.
 
     Joins users (a permanent identity), not sessions: a session row goes
     away on logout, and an INNER JOIN on it would silently drop that
@@ -362,7 +447,7 @@ def get_bids_for_auction(auction_id: str) -> list[dict]:
             FROM bids b
             LEFT JOIN users u ON b.bidder_id = u.user_id
             WHERE b.auction_id = ?
-            ORDER BY b.timestamp_ms ASC, b.rowid ASC
+            ORDER BY b.rowid ASC
         """, (auction_id,)).fetchall()
 
         return [dict(b) for b in result]
@@ -393,12 +478,13 @@ def get_closed_unsettled() -> list[dict]:
 
 
 def create_settlement(auction_id: str, winner_id: Optional[str], seller_id: str,
-                      final_price: float, buyers_premium: float, escrow_status: str) -> bool:
+                      final_price: float, buyers_premium: float, escrow_status: str,
+                      now_ms: Optional[int] = None) -> bool:
     """Record the mock escrow settlement for a closed auction. Idempotent:
     returns False (and changes nothing) if one already exists."""
     conn = get_connection()
     try:
-        now_ms = datetime.now().timestamp() * 1000
+        now_ms = now_ms if now_ms is not None else _now_ms()
         cur = conn.execute("""
             INSERT OR IGNORE INTO settlements
             (auction_id, winner_id, seller_id, final_price, buyers_premium, escrow_status, created_at)
@@ -406,6 +492,47 @@ def create_settlement(auction_id: str, winner_id: Optional[str], seller_id: str,
         """, (auction_id, winner_id, seller_id, final_price, buyers_premium, escrow_status, now_ms))
         conn.commit()
         return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def get_unsummarized() -> list[dict]:
+    """Settled auctions that have no recap yet, with what the recap needs."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT a.*, i.title, i.description, i.seller_id, s.winner_id, s.final_price
+            FROM settlements s
+            JOIN auctions a ON a.auction_id = s.auction_id
+            JOIN items i ON a.item_id = i.item_id
+            LEFT JOIN auction_summaries m ON m.auction_id = s.auction_id
+            WHERE m.auction_id IS NULL
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_request_result(bidder_id: str, request_id: str) -> Optional[str]:
+    """The stored outcome (JSON) of a request already applied, or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT result FROM applied_requests WHERE bidder_id = ? AND request_id = ?", (bidder_id, request_id)
+        ).fetchone()
+        return row["result"] if row else None
+    finally:
+        conn.close()
+
+
+def save_request_result(bidder_id: str, request_id: str, result: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO applied_requests (bidder_id, request_id, result) VALUES (?, ?, ?)",
+            (bidder_id, request_id, result),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -436,10 +563,10 @@ def get_average_sale_price(exclude_auction_id: str) -> Optional[float]:
         conn.close()
 
 
-def save_summary(auction_id: str, summary: str, from_fallback: bool) -> None:
+def save_summary(auction_id: str, summary: str, from_fallback: bool, now_ms: Optional[int] = None) -> None:
     conn = get_connection()
     try:
-        now_ms = datetime.now().timestamp() * 1000
+        now_ms = now_ms if now_ms is not None else _now_ms()
         conn.execute("""
             INSERT OR REPLACE INTO auction_summaries (auction_id, summary, from_fallback, created_at)
             VALUES (?, ?, ?, ?)

@@ -2,11 +2,14 @@
 #   docker compose -f deploy/docker-compose.yml up --build
 
 # The three app-server replicas share one image and differ only in identity.
+# init: a tiny init process forwards signals, so `docker compose stop` shuts a
+# node down at once instead of waiting 10 s to kill it.
 x-app-server: &app-server
   build:
     context: ..
     dockerfile: app_server/Dockerfile
   image: raftioneer-app-server
+  init: true
 
 services:
   # ---- Node 1: the LLM node -------------------------------------------
@@ -58,13 +61,18 @@ services:
   # The app servers deliberately do NOT depend on the LLM node: bidding
   # must work even if the AI layer is slow, still downloading its model,
   # or down. LLM features degrade to a plain-text fallback instead.
-  # PEERS lists the other replicas; Raft (Milestone 2) uses it.
+  # Together they form one Raft cluster. PEERS names the other members as
+  # node-id=host:port (Raft RPCs share the client port); SELF_ADDRESS is how
+  # the others reach this node, handed to clients as the leader_hint. Each
+  # node keeps its Raft log inside its container, so it survives
+  # `docker compose stop/kill` + `start`, and `down` starts the cluster afresh.
   app_server_1:
     <<: *app-server
     environment:
       - NODE_ID=app-server-1
       - PORT=50051
-      - PEERS=app_server_2:50051,app_server_3:50051
+      - SELF_ADDRESS=app_server_1:50051
+      - PEERS=app-server-2=app_server_2:50051,app-server-3=app_server_3:50051
       - LLM_SERVER=llm_server:50060
     ports:
       - "50051:50051"
@@ -74,7 +82,8 @@ services:
     environment:
       - NODE_ID=app-server-2
       - PORT=50051
-      - PEERS=app_server_1:50051,app_server_3:50051
+      - SELF_ADDRESS=app_server_2:50051
+      - PEERS=app-server-1=app_server_1:50051,app-server-3=app_server_3:50051
       - LLM_SERVER=llm_server:50060
     ports:
       - "50052:50051"
@@ -84,7 +93,8 @@ services:
     environment:
       - NODE_ID=app-server-3
       - PORT=50051
-      - PEERS=app_server_1:50051,app_server_2:50051
+      - SELF_ADDRESS=app_server_3:50051
+      - PEERS=app-server-1=app_server_1:50051,app-server-2=app_server_2:50051
       - LLM_SERVER=llm_server:50060
     ports:
       - "50053:50051"

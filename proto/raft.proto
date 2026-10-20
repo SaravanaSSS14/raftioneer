@@ -10,7 +10,7 @@ package raftioneer.raft;
 message LogEntry {
   int64 term = 1;
   int64 index = 2;
-  bytes command = 3; // serialized AuctionService write (e.g. a PlaceBidRequest)
+  bytes command = 3; // a state-machine command (JSON, see app_server/state_machine.py); empty = leader no-op
 }
 
 message RequestVoteRequest {

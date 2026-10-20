@@ -59,6 +59,16 @@ def auction_facts(auction: dict, bid_count: int, now_ms: float) -> str:
         lines.append(f"Next bid must be: {next_bid_rule(highest, reserve)}")
         seconds_left = max(0, int((auction["end_time_ms"] - now_ms) / 1000))
         lines.append(f"Time remaining: {seconds_left} seconds")
+        window = int(auction.get("snipe_window_ms") or 0) // 1000
+        if window and auction.get("original_end_ms"):
+            cap = int((auction["max_end_ms"] - auction["original_end_ms"]) / 1000)
+            lines.append(
+                f"Anti-sniping: a bid in the last {window} seconds moves the end time to {window} seconds "
+                f"after that bid, up to {cap} seconds past the original end time"
+            )
+            extended = int((auction["end_time_ms"] - auction["original_end_ms"]) / 1000)
+            if extended > 0:
+                lines.append(f"Clock extended so far: {extended} seconds")
     return "\n".join(lines)
 
 
@@ -80,11 +90,15 @@ def fallback_description(title: str) -> str:
     return f"{title.strip()} - listed by a student for the campus clearance auction."
 
 
-def compute_settlement(final_price: float, has_winner: bool) -> tuple[float, str]:
-    """(buyer's premium, escrow status) for a closed auction. Mock: nothing is charged."""
+def compute_settlement(final_price: float, has_winner: bool,
+                       premium_percent: float = BUYERS_PREMIUM_PERCENT) -> tuple[float, str]:
+    """(buyer's premium, escrow status) for a closed auction. Mock: nothing is charged.
+
+    Under Raft the percentage comes from the replicated command, so every node
+    settles with the leader's figure even if their own configuration differs."""
     if not has_winner:
         return 0.0, ESCROW_NO_SALE
-    return round(final_price * BUYERS_PREMIUM_PERCENT / 100.0, 2), ESCROW_HELD
+    return round(final_price * premium_percent / 100.0, 2), ESCROW_HELD
 
 
 def describe_trend(final_price: float, average_sale_price: Optional[float]) -> str:

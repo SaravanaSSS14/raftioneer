@@ -140,3 +140,19 @@ def test_fallback_summary_with_no_bids():
 
 def test_fallback_description_mentions_the_title():
     assert "Table fan" in assistant.fallback_description("  Table fan ")
+
+
+def test_context_states_the_anti_sniping_rule_and_any_extension():
+    original_end = NOW_MS + 60_000
+    auction = _auction(
+        end_time_ms=original_end + 12_000, original_end_ms=original_end,
+        snipe_window_ms=10_000, max_end_ms=original_end + 60_000,
+    )
+    facts = assistant.auction_facts(auction, 3, NOW_MS)
+    assert "a bid in the last 10 seconds" in facts
+    assert "up to 60 seconds past the original end time" in facts
+    assert "Clock extended so far: 12 seconds" in facts
+
+
+def test_context_without_anti_sniping_does_not_mention_it():
+    assert "Anti-sniping" not in assistant.auction_facts(_auction(), 0, NOW_MS)

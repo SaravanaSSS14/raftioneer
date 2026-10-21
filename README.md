@@ -37,6 +37,7 @@ and recaps every sale.
 - [API overview](#api-overview)
 - [Design decisions](#design-decisions)
 - [Testing](#testing)
+- [Performance](#performance)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
@@ -107,8 +108,9 @@ and recaps every sale.
 **Tooling**
 - Cluster status, an automated leader-failover check, a chaos run, a consistency checker, themed
   seed data, a guided tour, an auction board with replica agreement and anti-sniping extensions, a
-  concurrency stress test, smoke tests, and a 105-test pytest suite (including Raft tests with
-  simulated crashes and network partitions).
+  concurrency stress test, smoke tests, a randomized Raft churn test, and a 109-test pytest suite
+  (including Raft tests with simulated crashes and network partitions). CI runs the lint, every
+  test that needs no Docker, and a five-seed churn on every push.
 
 ## Architecture
 
@@ -198,9 +200,11 @@ llm_server/     LLM node: gRPC service, Ollama client, prompts
 client/         bidder simulation (four named personas), leader-aware
 deploy/         docker-compose.yml - the whole system
 scripts/        demo.py (the whole demo), cluster status, failover check, chaos run,
-                consistency check, seeding, guided tour, auction board, stress test, smoke
-                tests, narrate.py (shared presentation helpers), stub generation
+                consistency check, raft_churn.py (randomized Raft safety test, no Docker),
+                seeding, guided tour, auction board, stress test, smoke tests,
+                narrate.py (shared presentation helpers), stub generation
 tests/          pytest: Raft and state-machine tests (no Docker), contract tests (live stack)
+.github/        CI: lint, offline tests and a short churn on every push
 ```
 
 ## Getting started
@@ -209,7 +213,7 @@ tests/          pytest: Raft and state-machine tests (no Docker), contract tests
 
 - Docker with **Docker Compose v2** (`docker compose version`)
 - About 10 GB of free disk and an internet connection for the first run (the Ollama image and the
-  model); later runs are fully local
+  model); later runs are fully local, LLM node included
 - Python 3.12 for the helper scripts and tests (not needed just to run the system)
 - Ports `50051`–`50053` and `50060` free on the host
 
@@ -457,6 +461,9 @@ servers: `GetLLMAnswer`, `GenerateItemDescription`, `SummarizeAuction`.
   order — identically on every node — on top of the compare-and-set update.
 - **A new leader waits until it has applied its own no-op** before it validates any request, so it
   never judges a request against state that is missing a committed write from the previous leader.
+- **Group commit.** A proposal is queued, and the leader writes everything queued in one SQLite
+  transaction — one disk sync for the batch — before adding it to the log and replicating it.
+  Everything in the log is therefore always on disk, exactly as with one write per entry.
 - **A write that times out is reported as "may still go through".** Raft cannot tell an entry that
   will never commit from one that will commit late; the client is told exactly that — and for bids,
   a `request_id` makes retrying safe.
@@ -489,20 +496,24 @@ No running stack needed:
 
 ```bash
 pytest tests/test_raft.py tests/test_state_machine.py tests/test_assistant.py \
-       tests/test_llm_service.py tests/test_pricing_trend_db.py     # about 10 s
+       tests/test_llm_service.py tests/test_pricing_trend_db.py     # 71 tests, about 15 s
+python scripts/raft_churn.py                                        # 30 random seeds, a few minutes
 ```
 
 - [`tests/test_raft.py`](tests/test_raft.py) — the Raft implementation on an in-process network
   that can crash nodes and cut links: one leader per term, replication in order, a follower
   redirects, leader crash and recovery, a partitioned leader's uncommitted entry is discarded, a
-  full-cluster restart recovers from disk, safety through repeated random crashes, and the
-  `RequestVote` / `AppendEntries` rules one at a time.
+  full-cluster restart recovers from disk, safety through repeated random crashes, a new leader
+  backing up to repair a follower that missed entries, a leader deposed mid-request, group commit,
+  and the `RequestVote` / `AppendEntries` rules one at a time.
+- [`scripts/raft_churn.py`](scripts/raft_churn.py) — five servers, random crashes, restarts and
+  partitions over many seeds; checks one leader per term, no lost commits and identical state.
 - [`tests/test_state_machine.py`](tests/test_state_machine.py) — replaying the same log gives a
   byte-identical database; bid rules, settlement and recaps are applied deterministically;
   anti-sniping extends within the window and stops at the cap; a retried bid gets its original
   answer and is recorded once.
 
-With the system running, the whole suite (105 tests, about 40 s):
+With the system running, the whole suite (109 tests, about 40 s):
 
 ```bash
 pytest tests/
@@ -517,6 +528,26 @@ pytest tests/
 
 `scripts/chaos.py`, `scripts/consistency_check.py`, `scripts/failover_check.py`,
 `scripts/stress_bids.py` and `scripts/smoke_test.py` complement the suite from the outside.
+
+## Performance
+
+Measured on the Docker deployment (three app servers on one host), before and after group commit:
+
+| Measure | One disk write per entry | Group commit |
+| --- | --- | --- |
+| Commit latency, one bid at a time (p50 / p99) | 20.1 / 24.6 ms | 20.0 / 25.1 ms |
+| Throughput, 10 concurrent clients | 126 entries/s | 161 entries/s |
+| Throughput, 50 concurrent clients | 122 entries/s | 198 entries/s |
+| Throughput, 200 concurrent clients | 121 entries/s | 206 entries/s |
+| Latency at 200 concurrent clients (p50) | 1.63 s | 0.95 s |
+
+- **Under sustained load the leader keeps its leadership:** 6,000 bids from 300 concurrent clients
+  in 30 s, and every server stayed in the same term with the same leader.
+- **Restart cost:** a restarted server replayed an 11,715-entry log and caught up in 3.6 s.
+- **Where the limit is:** each SQLite commit with full sync costs about 4.5 ms, and it still runs on
+  the leader's event loop. In isolation Raft with group commit reaches about 4,500 commits/s; through
+  gRPC, requests arrive one at a time and batches stay small. Moving the disk write to a thread
+  would pipeline batches; that is listed as future work.
 
 ## Configuration
 
@@ -559,6 +590,8 @@ pytest tests/
 - **The Raft log is never compacted** (no snapshots), so a node's restart replays the whole log;
   fine at demo scale.
 - **Reads on a follower can trail the leader** by about one round trip; reads are not linearizable.
+- **Write throughput is about 200 entries/s** on one host (see Performance): the leader's disk sync
+  runs on its event loop. Ample for an auction; a thread for the write is the next step.
 - **Exactly-once covers bids only.** `Login`, `Logout` and `CreateAuction` have no `request_id`;
   a retried `CreateAuction` after a timeout can create a second listing. The request table also
   grows forever (it would be trimmed along with the log by snapshots).

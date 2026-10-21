@@ -3,3 +3,4 @@ grpcio-tools==1.83.1
 protobuf==7.36.1
 pytest==9.1.1
 ollama==0.6.2
+pyflakes==4.0.3

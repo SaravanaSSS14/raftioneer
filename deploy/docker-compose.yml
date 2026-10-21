@@ -29,9 +29,11 @@ services:
       retries: 24
       start_period: 5s
 
+  # Downloads the model once. If it is already in the volume, it does nothing -
+  # so the LLM node also starts with no internet access (an exam hall, say).
   ollama_pull:
     image: ollama/ollama:latest
-    entrypoint: ["ollama", "pull", "qwen2.5:1.5b"]
+    entrypoint: ["/bin/sh", "-c", "ollama list | grep -q '^qwen2.5:1.5b' || ollama pull qwen2.5:1.5b"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
     depends_on:

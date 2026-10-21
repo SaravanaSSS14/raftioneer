@@ -31,6 +31,7 @@ class Network:
     def __init__(self):
         self.nodes: dict[str, RaftNode] = {}
         self.cut: set[frozenset] = set()
+        self.replies: list[tuple[str, str, str, object]] = []  # (src, dst, handler, reply), for assertions
 
     def _check(self, src: str, dst: str) -> None:
         if src not in self.nodes or dst not in self.nodes or frozenset((src, dst)) in self.cut:
@@ -40,6 +41,7 @@ class Network:
         await asyncio.sleep(0.002)
         self._check(src, dst)
         reply = getattr(self.nodes[dst], handler)(request)
+        self.replies.append((src, dst, handler, reply))
         await asyncio.sleep(0.002)
         self._check(src, dst)  # the reply can be lost too
         return reply
@@ -211,6 +213,24 @@ def test_replicas_that_applied_the_same_entries_report_the_same_digest(tmp_path)
     run(scenario())
 
 
+def test_concurrent_proposals_share_one_disk_write(tmp_path):
+    """Group commit: proposals that arrive together are written to the
+    leader's disk in one transaction, and still applied everywhere in order."""
+
+    async def scenario():
+        cluster = Cluster(tmp_path)
+        cluster.start_all()
+        leader = await cluster.wait_for_leader()
+        before = leader.batches_flushed
+        results = await asyncio.gather(*(leader.propose(cmd(i)) for i in range(40)))
+        assert sorted(results) == list(range(1, 41))  # each applied exactly once
+        assert leader.batches_flushed - before < 5  # 40 proposals, a handful of fsyncs
+        await cluster.wait_applied(cluster.applied[leader.node_id])
+        await cluster.crash_all()
+
+    run(scenario())
+
+
 def test_a_follower_refuses_writes_and_names_the_leader(tmp_path):
     async def scenario():
         cluster = Cluster(tmp_path)
@@ -220,6 +240,8 @@ def test_a_follower_refuses_writes_and_names_the_leader(tmp_path):
         with pytest.raises(NotLeader) as info:
             await follower.propose(cmd(1))
         assert info.value.leader_id == leader.node_id
+        with pytest.raises(NotLeader):
+            await follower.wait_until_ready(0.1)  # a follower never validates writes
         await cluster.crash_all()
 
     run(scenario())
@@ -355,6 +377,89 @@ def test_one_leader_per_term_and_identical_logs_through_repeated_crashes(tmp_pat
         watcher.cancel()
         assert all(len(ids) == 1 for ids in leaders_by_term.values()), leaders_by_term
         await cluster.crash_all()
+
+    run(scenario())
+
+
+def test_a_new_leader_backs_up_to_repair_a_follower_that_missed_entries(tmp_path):
+    """The leader's back-up path: a follower whose log is shorter than the new
+    leader expects rejects AppendEntries; the leader steps next_index back
+    (using the follower's match_index hint) until the logs match, then fills
+    in everything that was missed."""
+
+    async def scenario():
+        cluster = Cluster(tmp_path)
+        cluster.start_all()
+        old = await cluster.wait_for_leader()
+        await old.propose(cmd(0))
+        lagging, other = [i for i in cluster.ids if i != old.node_id]
+        await cluster.crash(lagging)
+        for i in range(1, 6):
+            await old.propose(cmd(i))  # committed by the old leader and `other`
+        await cluster.crash(old.node_id)
+        cluster.start(lagging)  # back, but missing entries 1-5
+
+        new = await cluster.wait_for_leader(among=[lagging, other])
+        assert new.node_id == other  # the election restriction: the shorter log cannot win
+        await new.propose(cmd(6))
+        await cluster.wait_applied([cmd(i) for i in range(7)], among=[lagging, other])
+        rejected = [r for src, dst, h, r in cluster.network.replies
+                    if src == other and dst == lagging and h == "handle_append_entries" and not r.success]
+        assert rejected, "the new leader never had to back up"
+        await cluster.crash_all()
+
+    run(scenario())
+
+
+def test_a_leader_deposed_mid_request_reports_not_leader(tmp_path):
+    """A proposal waiting on a leader that loses its leadership must fail with
+    NotLeader - not hang, and not report success for an entry that is about
+    to be overwritten."""
+
+    async def scenario():
+        cluster = Cluster(tmp_path)
+        cluster.start_all()
+        old = await cluster.wait_for_leader()
+        await old.propose(cmd(0))
+        cluster.isolate(old.node_id)
+        pending = asyncio.create_task(old.propose(cmd("orphan"), timeout=10))
+        majority = [i for i in cluster.ids if i != old.node_id]
+        new = await cluster.wait_for_leader(among=majority)
+        await new.propose(cmd(1))
+        # Reconnect the old leader to the new leader's follower only, so it learns
+        # of the new term from the reply to its own AppendEntries.
+        follower = next(i for i in majority if i != new.node_id)
+        cluster.network.cut.discard(frozenset((old.node_id, follower)))
+        with pytest.raises(NotLeader):
+            await pending
+        # No longer leader. (Still cut off from the new leader, it may already be
+        # campaigning again - a candidate, legitimately, since there is no pre-vote.)
+        assert old.role != Role.LEADER
+        cluster.heal()
+        await cluster.wait_applied([cmd(0), cmd(1)])  # and the orphan entry is gone everywhere
+        await cluster.crash_all()
+
+    run(scenario())
+
+
+def test_a_command_whose_apply_fails_does_not_wedge_the_node(tmp_path):
+    async def scenario():
+        def apply(command):
+            if command == b"boom":
+                raise ValueError("bad command")
+            return command.decode()
+
+        node = RaftNode("solo", [], RaftStorage(str(tmp_path / "solo.db")), NoTransport(), apply,
+                        election_timeout=(0.05, 0.1), heartbeat_interval=0.02)
+        node.start()
+        for _ in range(100):
+            if node.is_leader:
+                break
+            await asyncio.sleep(0.02)
+        await node.wait_until_ready(1.0)
+        assert isinstance(await node.propose(b"boom"), ValueError)  # handed back, not raised inside the node
+        assert await node.propose(b"ok") == "ok"  # and the next entry still applies
+        await node.stop()
 
     run(scenario())
 

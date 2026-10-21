@@ -16,6 +16,10 @@ log = logging.getLogger("raft")
 # a long outage gets a series of bounded RPCs rather than one enormous one.
 MAX_ENTRIES_PER_RPC = 64
 
+# Group commit: how many times the flusher yields to let in-flight proposals
+# join a batch before writing it (each yield costs microseconds).
+MAX_BATCH_WAIT_YIELDS = 50
+
 # How often the election timer is checked. Small next to the election timeout.
 TICK_SECONDS = 0.02
 
@@ -104,6 +108,13 @@ class RaftNode:
         self._votes = 0
         self._deadline = 0.0
         self._waiters: dict[int, tuple[int, asyncio.Future]] = {}  # log index -> (term, future)
+        # Group commit: proposals queue here until the flusher writes them to
+        # disk together - one transaction, one fsync for the whole batch - and
+        # only then add them to the log. So everything in self.log is always on
+        # disk, exactly as with one write per entry, at a fraction of the cost.
+        self._pending: list[tuple[bytes, asyncio.Future]] = []
+        self._pending_ready = asyncio.Event()
+        self.batches_flushed = 0
         self._wakeups: dict[str, asyncio.Event] = {}
         self._commit_advanced = asyncio.Event()
         self._leader_tasks: list[asyncio.Task] = []
@@ -149,6 +160,7 @@ class RaftNode:
         self._background = [
             asyncio.create_task(self._election_timer_loop()),
             asyncio.create_task(self._apply_loop()),
+            asyncio.create_task(self._flush_loop()),
         ]
         self._log(logging.INFO, "started with %d log entries; peers %s", self.last_index, self.peer_ids)
 
@@ -434,9 +446,56 @@ class RaftNode:
 
     def _fail_waiters(self) -> None:
         waiters, self._waiters = self._waiters, {}
-        for _, future in waiters.values():
+        pending, self._pending = self._pending, []
+        for future in [f for _, f in waiters.values()] + [f for _, f in pending]:
             if not future.done():
                 future.set_exception(NotLeader(self.leader_id))
+
+    def _forget(self, future: asyncio.Future) -> None:
+        """Drop a proposal its caller has stopped waiting for. If it was still
+        queued it is never written; if it was written, it may yet commit."""
+        self._pending = [(c, f) for c, f in self._pending if f is not future]
+        for index in [i for i, (_, f) in self._waiters.items() if f is future]:
+            del self._waiters[index]
+
+    async def _flush_loop(self) -> None:
+        """Group commit, on the leader: write every queued proposal to disk in
+        one transaction, then append the batch to the log and replicate it.
+        Proposals that arrive while one batch is being written wait for the
+        next, so under load many entries share each fsync."""
+        while self._running:
+            await self._pending_ready.wait()
+            # Requests already in flight should join this batch: gRPC hands them
+            # to the event loop one at a time, so keep yielding while proposals
+            # are still arriving (bounded). A lone request yields once and goes.
+            for _ in range(MAX_BATCH_WAIT_YIELDS):
+                queued = len(self._pending)
+                await asyncio.sleep(0)
+                if len(self._pending) == queued:
+                    break
+            self._pending_ready.clear()
+            batch, self._pending = self._pending, []
+            if not batch:
+                continue
+            if self.role != Role.LEADER:  # deposed before the batch was written
+                for _, future in batch:
+                    if not future.done():
+                        future.set_exception(NotLeader(self.leader_id))
+                continue
+            first = self.last_index + 1
+            entries = [
+                raft_pb2.LogEntry(term=self.current_term, index=first + i, command=command)
+                for i, (command, _) in enumerate(batch)
+            ]
+            self.storage.append([(e.index, e.term, e.command) for e in entries])  # on disk first
+            self.log.extend(entries)
+            self.batches_flushed += 1
+            for entry, (_, future) in zip(entries, batch):
+                if not future.done():
+                    self._waiters[entry.index] = (entry.term, future)
+            for wakeup in self._wakeups.values():
+                wakeup.set()
+            self._advance_commit_index()  # a one-node cluster needs no replies
 
     # ------------------------------------------------------------------ the application's API
 
@@ -465,20 +524,17 @@ class RaftNode:
         """
         if self.role != Role.LEADER:
             raise NotLeader(self.leader_id)
-        index = self._append_to_own_log(command)
         future = asyncio.get_running_loop().create_future()
         # If the caller has gone (e.g. its RPC was cancelled), still consume the
         # outcome so asyncio doesn't warn about an unretrieved exception.
         future.add_done_callback(lambda f: f.cancelled() or f.exception())
-        self._waiters[index] = (self.current_term, future)
-        for wakeup in self._wakeups.values():
-            wakeup.set()
-        self._advance_commit_index()  # a one-node cluster needs no replies
+        self._pending.append((command, future))  # written by the next group commit
+        self._pending_ready.set()
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout)
         except asyncio.TimeoutError:
-            self._waiters.pop(index, None)
-            raise ProposalTimeout(f"entry {index} not committed within {timeout}s") from None
+            self._forget(future)
+            raise ProposalTimeout(f"not committed within {timeout}s") from None
 
     def status(self) -> dict:
         return {

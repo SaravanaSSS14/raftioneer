@@ -201,7 +201,7 @@ client/         bidder simulation (four named personas), leader-aware
 deploy/         docker-compose.yml - the whole system
 scripts/        demo.py (the whole demo), cluster status, failover check, chaos run,
                 consistency check, raft_churn.py (randomized Raft safety test, no Docker),
-                seeding, guided tour, auction board, stress test, smoke tests,
+                seeding, guided tour, auction board, stress test, write benchmark, smoke tests,
                 narrate.py (shared presentation helpers), stub generation
 tests/          pytest: Raft and state-machine tests (no Docker), contract tests (live stack)
 .github/        CI: lint, offline tests and a short churn on every push
@@ -531,7 +531,8 @@ pytest tests/
 
 ## Performance
 
-Measured on the Docker deployment (three app servers on one host), before and after group commit:
+Measured on the Docker deployment (three app servers on one host) with `python scripts/benchmark.py`,
+before and after group commit:
 
 | Measure | One disk write per entry | Group commit |
 | --- | --- | --- |

@@ -381,5 +381,5 @@ tests/             pytest suites (offline and live)
 | Ashutosh Golani | 2026H1030082P |
 
 Reference: D. Ongaro and J. Ousterhout, *In Search of an Understandable Consensus Algorithm
-(Extended Version)*; D. Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis, §9.6 on
+(Extended Version)*; D. Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis, Section 9.6 on
 pre-vote).

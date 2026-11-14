@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import uuid
 
-from nicegui import ui
+from nicegui import app, ui
 
 import theme
 from backend import Session, bid_history, get_auction, snapshots
@@ -99,6 +99,34 @@ class Floor:
         self._build()
         ui.timer(1.0, self.tick)
         ui.timer(2.0, self.refresh_wallet)
+        ui.timer(0.1, self._restore_session, once=True)
+
+    # A sign-in survives a page reload: it is kept in this browser's storage
+    # and restored if the cluster still accepts the session.
+
+    def _remember(self) -> None:
+        app.storage.user["session"] = {"token": self.session.token, "username": self.session.username,
+                                       "user_id": self.session.user_id}
+
+    def _forget(self) -> None:
+        app.storage.user.pop("session", None)
+
+    async def _restore_session(self) -> None:
+        saved = app.storage.user.get("session")
+        if not saved or self.session.signed_in:
+            return
+        self.session.token, self.session.username, self.session.user_id = (
+            saved["token"], saved["username"], saved["user_id"])
+        try:
+            wallet = await self.session.wallet()
+            valid = wallet.success
+        except Exception:
+            valid = False
+        if not valid:
+            self.session.token = ""
+            self._forget()
+        self._build_side()
+        self.version_seen = -1
 
     # ------------------------------------------------------------ layout
 
@@ -233,6 +261,7 @@ class Floor:
                 if reply is None:
                     ui.notify("The cluster has no leader right now - try again in a moment", type="warning")
                 elif reply.success:
+                    self._remember()
                     ui.notify(f"Signed in as {self.session.username}", type="positive")
                     self._build_side()
                     self.version_seen = -1
@@ -263,6 +292,7 @@ class Floor:
 
                 async def sign_out() -> None:
                     await self.session.logout()
+                    self._forget()
                     self._build_side()
                     self.version_seen = -1
 
@@ -327,6 +357,7 @@ class Floor:
         if not wallet.success:  # session expired or replaced
             if "session" in wallet.error_message.lower():
                 self.session.token = ""
+                self._forget()
                 self._build_side()
             return
         for key in ("balance", "available", "committed", "in_escrow"):

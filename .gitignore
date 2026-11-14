@@ -8,3 +8,6 @@ generated/
 
 # Raft log + rebuilt auction database of locally-run app servers
 app_server/data/
+
+# NiceGUI per-browser storage (the dashboard keeps sign-ins across reloads)
+.nicegui/

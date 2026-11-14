@@ -543,3 +543,93 @@ def test_conflicting_suffix_is_replaced_and_duplicates_are_harmless(tmp_path):
     assert [e.term for e in node.log] == [1, 2, 2]  # did not shorten the log
     node.storage.close()
     assert [t for t, _ in RaftStorage(str(tmp_path / "solo.db")).load()[2]] == [1, 2, 2]  # and on disk too
+
+
+# ---------------------------------------------------------------- pre-vote
+
+
+def pre_vote(term, candidate, last_index, last_term):
+    return raft_pb2.RequestVoteRequest(
+        term=term, candidate_id=candidate, last_log_index=last_index, last_log_term=last_term, pre_vote=True
+    )
+
+
+def test_a_pre_vote_changes_nothing_on_the_voter(tmp_path):
+    node = make_node(tmp_path, log_terms=(1, 2), term=2)
+    reply = node.handle_request_vote(pre_vote(3, "a", 2, 2))
+    assert reply.vote_granted
+    assert node.current_term == 2 and node.voted_for is None  # no term change, no vote recorded
+    assert node.storage.load()[:2] == (2, None)
+
+
+def test_a_pre_vote_follows_the_election_restriction(tmp_path):
+    node = make_node(tmp_path, log_terms=(1, 1, 2), term=2)
+    assert not node.handle_request_vote(pre_vote(2, "a", 9, 9)).vote_granted  # not a later term
+    assert not node.handle_request_vote(pre_vote(3, "a", 2, 2)).vote_granted  # shorter log
+    assert node.handle_request_vote(pre_vote(3, "a", 3, 2)).vote_granted
+
+
+def test_a_node_hearing_from_its_leader_refuses_pre_votes(tmp_path):
+    node = make_node(tmp_path, log_terms=(1,), term=1)
+    node.handle_append_entries(append(1, 1, 1, []))  # a heartbeat from leader "a"
+    assert not node.handle_request_vote(pre_vote(2, "b", 1, 1)).vote_granted
+
+
+def test_a_rejoining_node_does_not_disrupt_a_healthy_leader(tmp_path):
+    """The case pre-vote exists for: a node cut off for a while keeps timing
+    out. Without pre-vote its term climbs, and on rejoining it forces the
+    healthy leader to step down. With it, the term never moves."""
+    async def scenario():
+        cluster = Cluster(tmp_path, seed=7)
+        cluster.start_all()
+        leader = await cluster.wait_for_leader()
+        term = leader.current_term
+        cut_off = next(i for i in cluster.ids if i != leader.node_id)
+        cluster.isolate(cut_off)
+        await asyncio.sleep(ELECTION_TIMEOUT[1] * 5)  # several election timeouts alone
+        assert cluster.node(cut_off).current_term == term  # pre-votes failed: no term bump
+        cluster.heal()
+        await asyncio.sleep(ELECTION_TIMEOUT[1] * 3)
+        assert leader.role == Role.LEADER and leader.current_term == term  # never deposed
+        assert all(cluster.node(i).current_term == term for i in cluster.ids)
+        await cluster.crash_all()
+
+    run(scenario())
+
+
+def test_without_pre_vote_a_rejoining_node_does_disrupt_the_leader(tmp_path):
+    """The same scenario with pre-vote off, to show what it prevents."""
+    async def scenario():
+        cluster = Cluster(tmp_path, seed=7)
+        for node_id in cluster.ids:
+            cluster.start(node_id).pre_vote = False
+        leader = await cluster.wait_for_leader()
+        term = leader.current_term
+        cut_off = next(i for i in cluster.ids if i != leader.node_id)
+        cluster.isolate(cut_off)
+        await asyncio.sleep(ELECTION_TIMEOUT[1] * 5)
+        assert cluster.node(cut_off).current_term > term  # it kept starting elections
+        cluster.heal()
+        await asyncio.sleep(ELECTION_TIMEOUT[1] * 3)  # the higher term reaches the leader in a heartbeat
+        assert leader.current_term > term  # the healthy leader had to give up its term
+        new_leader = await cluster.wait_for_leader()
+        assert new_leader.current_term > term
+        await cluster.crash_all()
+
+    run(scenario())
+
+
+def test_after_a_real_leader_crash_pre_vote_still_elects_quickly(tmp_path):
+    async def scenario():
+        cluster = Cluster(tmp_path, seed=3)
+        cluster.start_all()
+        leader = await cluster.wait_for_leader()
+        survivors = [i for i in cluster.ids if i != leader.node_id]
+        await cluster.crash(leader.node_id)
+        started = asyncio.get_running_loop().time()
+        new_leader = await cluster.wait_for_leader(among=survivors)
+        assert new_leader.current_term == leader.current_term + 1  # one clean election, no extra terms
+        assert asyncio.get_running_loop().time() - started < ELECTION_TIMEOUT[1] * 4
+        await cluster.crash_all()
+
+    run(scenario())

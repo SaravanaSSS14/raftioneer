@@ -72,6 +72,7 @@ class RaftNode:
         election_timeout: tuple[float, float] = (0.8, 1.6),
         heartbeat_interval: float = 0.2,
         rng: Optional[random.Random] = None,
+        pre_vote: bool = True,
     ):
         self.node_id = node_id
         self.peer_ids = list(peer_ids)
@@ -81,6 +82,12 @@ class RaftNode:
         self.election_timeout = election_timeout
         self.heartbeat_interval = heartbeat_interval
         self.rng = rng or random.Random()
+        # Pre-vote: a node whose timer fires first checks that it could win
+        # before it bumps its term. A voter refuses while it has heard from a
+        # leader within `leader_lease` - several heartbeats, well inside the
+        # shortest election timeout - so a live leader is never disrupted.
+        self.pre_vote = pre_vote
+        self.leader_lease = election_timeout[0] * 0.75
 
         # Persistent state on all servers - restored from disk.
         self.current_term, self.voted_for, stored = storage.load()
@@ -106,6 +113,9 @@ class RaftNode:
         self._term_start_index = 0  # index of the no-op this leader appended on election
 
         self._votes = 0
+        self._pre_votes = 0
+        self._pre_vote_round = 0
+        self._last_leader_contact = float("-inf")  # when we last heard from a current leader
         self._deadline = 0.0
         self._waiters: dict[int, tuple[int, asyncio.Future]] = {}  # log index -> (term, future)
         # Group commit: proposals queue here until the flusher writes them to
@@ -180,7 +190,10 @@ class RaftNode:
         while self._running:
             await asyncio.sleep(TICK_SECONDS)
             if self.role != Role.LEADER and self._now() >= self._deadline:
-                self._start_election()
+                if self.pre_vote:
+                    self._start_pre_vote()
+                else:
+                    self._start_election()
 
     # ------------------------------------------------------------------ elections
 
@@ -202,8 +215,57 @@ class RaftNode:
             self.leader_id = None
             self._fail_waiters()
 
+    def _start_pre_vote(self) -> None:
+        """Before a real election: ask whether we could win one, without
+        changing our term. Why it matters: a node that was frozen, cut off or
+        just restarted would otherwise bump its term the moment its timer
+        fired, and that higher term forces a healthy leader to step down.
+        With pre-vote it asks first, the others - still hearing from their
+        leader - say no, and nothing is disrupted. If the leader really is
+        gone, the others have stopped hearing from it too, they say yes, and
+        the election goes ahead one round trip later."""
+        for task in self._election_tasks:
+            task.cancel()
+        self._reset_election_timer()  # if this round fails, try again after another timeout
+        self.leader_id = None
+        self._pre_vote_round += 1
+        self._pre_votes = 1  # our own
+        self._log(logging.INFO, "election timeout - asking for pre-votes for term %d", self.current_term + 1)
+        if self._pre_votes >= self.majority:  # a one-node cluster
+            self._start_election()
+            return
+        round_id, term = self._pre_vote_round, self.current_term
+        self._election_tasks = [
+            asyncio.create_task(self._request_pre_vote_from(peer, round_id, term)) for peer in self.peer_ids
+        ]
+
+    async def _request_pre_vote_from(self, peer: str, round_id: int, term: int) -> None:
+        request = raft_pb2.RequestVoteRequest(
+            term=term + 1,  # the term we would stand in; our own term is unchanged
+            candidate_id=self.node_id,
+            last_log_index=self.last_index,
+            last_log_term=self.term_at(self.last_index),
+            to_id=peer,
+            pre_vote=True,
+        )
+        try:
+            reply = await self.transport.request_vote(peer, request)
+        except Exception:
+            return  # unreachable: a pre-vote we don't get
+        if round_id != self._pre_vote_round or self.current_term != term or self.role == Role.LEADER:
+            return  # that round is over
+        if reply.term > self.current_term:
+            self._become_follower(reply.term)  # the cluster has moved on to a later term
+            return
+        if reply.vote_granted:
+            self._pre_votes += 1
+            if self._pre_votes >= self.majority:
+                self._log(logging.INFO, "pre-vote won (%d of %d) - starting the election",
+                          self._pre_votes, len(self.peer_ids) + 1)
+                self._start_election()
+
     def _start_election(self) -> None:
-        for task in self._election_tasks:  # a previous, failed election
+        for task in self._election_tasks:  # a previous, failed election (or the pre-vote round)
             task.cancel()
         self.role = Role.CANDIDATE
         self.leader_id = None
@@ -212,7 +274,7 @@ class RaftNode:
         self.storage.save_term_and_vote(self.current_term, self.voted_for)
         self._reset_election_timer()
         self._votes = 1  # our own
-        self._log(logging.INFO, "election timeout - starting an election")
+        self._log(logging.INFO, "starting an election")
 
         if self._votes >= self.majority:  # a one-node cluster
             self._become_leader()
@@ -226,6 +288,7 @@ class RaftNode:
             candidate_id=self.node_id,
             last_log_index=self.last_index,
             last_log_term=self.term_at(self.last_index),
+            to_id=peer,
         )
         try:
             reply = await self.transport.request_vote(peer, request)
@@ -264,8 +327,10 @@ class RaftNode:
     # ------------------------------------------------------------------ RPC handlers
 
     def handle_request_vote(self, req: raft_pb2.RequestVoteRequest) -> raft_pb2.RequestVoteResponse:
+        if req.pre_vote:
+            return self._handle_pre_vote(req)
         if req.term < self.current_term:
-            return raft_pb2.RequestVoteResponse(term=self.current_term, vote_granted=False)
+            return self._vote_reply(req, False)
         if req.term > self.current_term:
             self._become_follower(req.term)
 
@@ -283,28 +348,54 @@ class RaftNode:
             logging.INFO, "vote request from %s (last log term %d, index %d): %s",
             req.candidate_id, req.last_log_term, req.last_log_index, "granted" if granted else "refused",
         )
-        return raft_pb2.RequestVoteResponse(term=self.current_term, vote_granted=granted)
+        return self._vote_reply(req, granted)
+
+    def _handle_pre_vote(self, req: raft_pb2.RequestVoteRequest) -> raft_pb2.RequestVoteResponse:
+        """Would we vote for this candidate in req.term? Answered without
+        changing anything: no term change, no vote recorded, timer untouched.
+        Yes only if that term is later than ours, the candidate's log is at
+        least as up to date (the same election restriction as a real vote),
+        and we have not heard from a leader recently."""
+        candidate_log = (req.last_log_term, req.last_log_index)
+        our_log = (self.term_at(self.last_index), self.last_index)
+        leader_alive = self.role == Role.LEADER or self._now() - self._last_leader_contact < self.leader_lease
+        granted = req.term > self.current_term and candidate_log >= our_log and not leader_alive
+        self._log(
+            logging.INFO, "pre-vote request from %s for term %d: %s", req.candidate_id, req.term,
+            "granted" if granted else ("refused - the leader is alive" if leader_alive else "refused"),
+        )
+        return self._vote_reply(req, granted)
+
+    def _vote_reply(self, req: raft_pb2.RequestVoteRequest, granted: bool) -> raft_pb2.RequestVoteResponse:
+        return raft_pb2.RequestVoteResponse(
+            term=self.current_term, vote_granted=granted, from_id=self.node_id, to_id=req.candidate_id
+        )
+
+    def _append_reply(self, req: raft_pb2.AppendEntriesRequest, success: bool, match_index: int):
+        return raft_pb2.AppendEntriesResponse(
+            term=self.current_term, success=success, match_index=match_index,
+            from_id=self.node_id, to_id=req.leader_id,
+        )
 
     def handle_append_entries(self, req: raft_pb2.AppendEntriesRequest) -> raft_pb2.AppendEntriesResponse:
         if req.term < self.current_term:  # from a deposed leader
-            return raft_pb2.AppendEntriesResponse(term=self.current_term, success=False, match_index=0)
+            return self._append_reply(req, False, 0)
         # A legitimate leader for this term: follow it.
         if req.term > self.current_term or self.role != Role.FOLLOWER:
             self._become_follower(req.term)
         if self.leader_id != req.leader_id:
             self.leader_id = req.leader_id
             self._log(logging.INFO, "following leader %s", req.leader_id)
+        self._last_leader_contact = self._now()
         self._reset_election_timer()
 
         # Consistency check: we must already hold the entry just before the new
         # ones, with the same term. If not, refuse; the leader backs up and
         # retries. match_index tells it where to retry from.
         if req.prev_log_index > self.last_index:
-            return raft_pb2.AppendEntriesResponse(term=self.current_term, success=False, match_index=self.last_index)
+            return self._append_reply(req, False, self.last_index)
         if self.term_at(req.prev_log_index) != req.prev_log_term:
-            return raft_pb2.AppendEntriesResponse(
-                term=self.current_term, success=False, match_index=req.prev_log_index - 1
-            )
+            return self._append_reply(req, False, req.prev_log_index - 1)
 
         # Append, first deleting any entry that conflicts with the leader's.
         # Entries we already hold are skipped rather than rewritten, so a late,
@@ -324,7 +415,7 @@ class RaftNode:
         if req.leader_commit > self.commit_index:
             self.commit_index = min(req.leader_commit, last_new_index)
             self._commit_advanced.set()
-        return raft_pb2.AppendEntriesResponse(term=self.current_term, success=True, match_index=last_new_index)
+        return self._append_reply(req, True, last_new_index)
 
     def _truncate_log_from(self, index: int) -> None:
         # Raft guarantees a committed entry is never replaced. If this fires,
@@ -368,6 +459,7 @@ class RaftNode:
             prev_log_term=self.term_at(prev_index),
             entries=self.log[prev_index: prev_index + MAX_ENTRIES_PER_RPC],
             leader_commit=self.commit_index,
+            to_id=peer,
         )
         try:
             reply = await self.transport.append_entries(peer, request)
@@ -535,6 +627,10 @@ class RaftNode:
         except asyncio.TimeoutError:
             self._forget(future)
             raise ProposalTimeout(f"not committed within {timeout}s") from None
+
+    def tail(self, count: int) -> list[raft_pb2.LogEntry]:
+        """The last `count` entries of this node's log, oldest first."""
+        return self.log[-count:] if count > 0 else []
 
     def status(self) -> dict:
         return {

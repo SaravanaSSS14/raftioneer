@@ -23,6 +23,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, wait_until_replicated
+from accounts import sign_in
 from narrate import aside
 
 TIMEOUT_SECONDS = 3
@@ -94,10 +95,7 @@ def seed_on(address: str) -> int:
     with grpc.insecure_channel(address) as channel:
         stub = auction_pb2_grpc.AuctionServiceStub(channel)
         for item in ITEMS:
-            login = stub.Login(
-                auction_pb2.LoginRequest(username=item["seller"], password=item["password"]),
-                timeout=TIMEOUT_SECONDS,
-            )
+            login = sign_in(channel, item["seller"], item["password"], timeout=TIMEOUT_SECONDS)
             if not login.success:
                 print(f"  ! {address}: login failed for {item['seller']} ({login.error_message})")
                 continue

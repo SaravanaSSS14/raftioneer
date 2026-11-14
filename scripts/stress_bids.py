@@ -33,13 +33,14 @@ import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, wait_until_replicated
 import narrate
+from accounts import sign_in_async
 
 
 async def run(server: str, replicas: list[str], bidders: int, bids: int) -> int:
     async with grpc.aio.insecure_channel(server) as channel:
         stub = auction_pb2_grpc.AuctionServiceStub(channel)
 
-        seller = await stub.Login(auction_pb2.LoginRequest(username="stress_seller", password="stress123"))
+        seller = await sign_in_async(channel, "stress_seller", "stress123")
         created = await stub.CreateAuction(
             auction_pb2.CreateAuctionRequest(
                 session_token=seller.session_token, title="Stress-test item",
@@ -54,9 +55,8 @@ async def run(server: str, replicas: list[str], bidders: int, bids: int) -> int:
 
         tokens = []
         for i in range(bidders):
-            login = await stub.Login(
-                auction_pb2.LoginRequest(username=f"stress_bidder_{i}", password="stress123")
-            )
+            # bids go up to Rs 20,000 (+5% premium)
+            login = await sign_in_async(channel, f"stress_bidder_{i}", "stress123", funds=25_000)
             tokens.append(login.session_token)
 
         async def bid(amount: float):

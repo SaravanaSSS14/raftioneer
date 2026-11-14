@@ -34,6 +34,7 @@ sys.path.insert(0, "generated")
 
 import auction_pb2
 import auction_pb2_grpc
+from accounts import sign_in_async
 from cluster import DEFAULT_SERVERS, find_leader, statuses
 
 
@@ -45,7 +46,7 @@ def percentile(values: list[float], p: float) -> float:
 async def run(server: str, sequential: int, bids: int, levels: list[int]) -> int:
     async with grpc.aio.insecure_channel(server) as channel:
         stub = auction_pb2_grpc.AuctionServiceStub(channel)
-        seller = await stub.Login(auction_pb2.LoginRequest(username="bench_seller", password="bench12345"))
+        seller = await sign_in_async(channel, "bench_seller", "bench12345")
         created = await stub.CreateAuction(
             auction_pb2.CreateAuctionRequest(
                 session_token=seller.session_token, title="Benchmark item",
@@ -57,7 +58,8 @@ async def run(server: str, sequential: int, bids: int, levels: list[int]) -> int
             return 1
         tokens = []
         for i in range(20):
-            login = await stub.Login(auction_pb2.LoginRequest(username=f"bench_{i}", password="bench12345"))
+            # bids start at Rs 10,00,000 and climb
+            login = await sign_in_async(channel, f"bench_{i}", "bench12345", funds=5_000_000)
             tokens.append(login.session_token)
 
         async def bid(token: str, amount: float) -> float:

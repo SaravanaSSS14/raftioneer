@@ -33,6 +33,10 @@ ELECTION_TIMEOUT = (
     float(os.environ.get("RAFT_ELECTION_TIMEOUT_MAX", "1.6")),
 )
 HEARTBEAT_SECONDS = float(os.environ.get("RAFT_HEARTBEAT_SECONDS", "0.2"))
+# Pre-vote (thesis section 9.6): a node checks it could win before starting
+# an election, so a frozen, cut-off or restarted node can't depose a healthy
+# leader. RAFT_PRE_VOTE=0 turns it off (to compare).
+PRE_VOTE = os.environ.get("RAFT_PRE_VOTE", "1") != "0"
 # How long a write waits to be committed before the client is told it failed.
 COMMIT_TIMEOUT_SECONDS = float(os.environ.get("RAFT_COMMIT_TIMEOUT_SECONDS", "2.0"))
 
@@ -43,6 +47,21 @@ ANTI_SNIPE_WINDOW_SECONDS = int(os.environ.get("ANTI_SNIPE_WINDOW_SECONDS", "10"
 ANTI_SNIPE_MAX_EXTENSION_SECONDS = int(os.environ.get("ANTI_SNIPE_MAX_EXTENSION_SECONDS", "60"))
 
 MAX_REQUEST_ID_LENGTH = 64
+
+# Accounts. Usernames are 3-32 letters, digits, '_', '-' or '.'; passwords at
+# least 6 characters.
+USERNAME_PATTERN = r"[A-Za-z0-9_.-]{3,32}"
+MIN_PASSWORD_LENGTH = 6
+
+# Mock payments: every new account's wallet opens with this credit, and one
+# deposit can add at most MAX_DEPOSIT. Like the buyer's premium, the leader
+# puts the value into the command, so every node credits the same amount.
+WELCOME_CREDIT = float(os.environ.get("WELCOME_CREDIT", "5000"))
+MAX_DEPOSIT = 10_000_000.0
+
+# How many of its newest log entries each node reports in GetClusterStatus
+# (drawn by the demo UI).
+STATUS_LOG_TAIL = 14
 
 # The LLM node is optional infrastructure: if it isn't configured, or is slow
 # or down, every LLM-backed feature falls back to plain text and bidding is

@@ -1,8 +1,8 @@
 """The replicated state machine: what a committed Raft log entry *does*.
 
 Every change to auction state - registering a user, a session, a new auction,
-a bid, closing and settling auctions, saving a recap - is a command in the
-Raft log. Each node applies the committed commands in log order to its own
+a bid, a deposit, closing and settling auctions (escrow), a confirmed
+hand-over, saving a recap - is a command in the Raft log. Each node applies the committed commands in log order to its own
 SQLite database, so all nodes end up with identical data.
 
 For that to work, apply() must be deterministic: the same command must have
@@ -27,6 +27,34 @@ def encode(op: str, **fields) -> bytes:
     return json.dumps({"op": op, **fields}, sort_keys=True).encode()
 
 
+def describe(command: bytes) -> dict:
+    """{"op": ..., "label": ...} for one log entry - a short line for people
+    watching the log (the demo UI), never used to change state."""
+    if not command:
+        return {"op": "NOOP", "label": "new leader's no-op"}
+    try:
+        cmd = json.loads(command)
+    except ValueError:
+        return {"op": "?", "label": "unreadable entry"}
+    op = cmd.get("op", "?")
+
+    def name(user_id):
+        return (user_id or "").removeprefix("user_")
+
+    labels = {
+        "REGISTER": lambda: f"register {cmd.get('username')}",
+        "LOGIN": lambda: f"login {cmd.get('username')}",
+        "LOGOUT": lambda: "logout",
+        "CREATE_AUCTION": lambda: f"list \"{cmd.get('title', '')[:22]}\"",
+        "PLACE_BID": lambda: f"{name(cmd.get('bidder_id'))} bids {assistant.money(cmd.get('amount', 0))}",
+        "CLOSE_EXPIRED": lambda: "close ended auctions",
+        "SAVE_SUMMARY": lambda: f"recap {cmd.get('auction_id')}",
+        "DEPOSIT": lambda: f"{name(cmd.get('user_id'))} deposits {assistant.money(cmd.get('amount', 0))}",
+        "CONFIRM_RECEIPT": lambda: f"{name(cmd.get('user_id'))} releases escrow",
+    }
+    return {"op": op, "label": labels[op]() if op in labels else op.lower()}
+
+
 def apply(command: bytes) -> dict:
     cmd = json.loads(command)
     handler = _HANDLERS.get(cmd.get("op"))
@@ -36,21 +64,25 @@ def apply(command: bytes) -> dict:
     return handler(cmd)
 
 
-def _login(cmd: dict) -> dict:
-    """Start a session, registering the user first if this is their first login.
+def _register(cmd: dict) -> dict:
+    """Create an account and open its wallet with the welcome credit.
 
-    The leader has already checked the password. One race is settled here:
-    two first logins for the same new username can both reach the log before
-    either is applied. The first registers the name; the second carries a
-    different password hash and is refused rather than logged in.
+    The leader has already hashed the password and checked the name is free,
+    but two registrations for the same new name can both reach the log before
+    either is applied: the first one applied wins, the second is refused - in
+    the same order, so with the same result, on every node.
     """
-    user = database.get_user(cmd["username"])
-    if user is None:
-        if not cmd.get("password_hash"):
-            return {"ok": False, "error": "Invalid username or password"}
-        database.create_user(cmd["username"], cmd["user_id"], cmd["password_hash"], now_ms=cmd["now_ms"])
-        log.info("registered new user %s", cmd["username"])
-    elif cmd.get("password_hash") and cmd["password_hash"] != user["password_hash"]:
+    if not database.create_user(cmd["username"], cmd["user_id"], cmd["password_hash"], now_ms=cmd["now_ms"]):
+        return {"ok": False, "error": "Username already taken"}
+    database.create_wallet(cmd["user_id"], cmd.get("welcome_credit", 0.0), cmd["now_ms"])
+    log.info("registered new user %s (welcome credit %s)", cmd["username"], cmd.get("welcome_credit", 0.0))
+    return {"ok": True}
+
+
+def _login(cmd: dict) -> dict:
+    """Start a session for an existing user (the leader has checked the
+    password). Accounts are only ever created by REGISTER."""
+    if database.get_user(cmd["username"]) is None:
         return {"ok": False, "error": "Invalid username or password"}
     database.create_session(cmd["session_token"], cmd["user_id"], cmd["username"], now_ms=cmd["now_ms"])
     return {"ok": True}
@@ -99,12 +131,19 @@ def _place_bid(cmd: dict) -> dict:
             return {**json.loads(stored), "replayed": True}
 
     before = database.get_auction(cmd["auction_id"])
+    # Funds are judged here too, against the replicated wallets: what the
+    # bidder has, less what they have already promised to auctions they are
+    # winning. The premium percentage travels in the command (set by the
+    # leader), like every other value that could differ between nodes.
+    premium_percent = cmd.get("premium_percent", 0.0)
     accepted, message = database.create_bid(
         auction_id=cmd["auction_id"],
         bidder_id=cmd["bidder_id"],
         amount=cmd["amount"],
         now_ms=cmd["now_ms"],
         bid_id=cmd["bid_id"],
+        available_funds=database.available_funds(cmd["bidder_id"], premium_percent, cmd["auction_id"]),
+        premium_percent=premium_percent,
     )
     result = {"ok": accepted, "message": message}
     if accepted:
@@ -141,22 +180,57 @@ def _close_expired(cmd: dict) -> dict:
 
 
 def _settle(record: dict, now_ms: int, premium_percent: float) -> None:
-    """Mock escrow settlement. Nothing is charged: it records what a real
-    payment step would hold."""
+    """Settle a closed auction: the winner's price plus the buyer's premium
+    moves from their wallet into escrow (HELD), where it stays until they
+    confirm the hand-over (CONFIRM_RECEIPT). Mock money: wallet numbers in the
+    replicated state, nothing real is charged."""
     winner_id = record["current_highest_bidder_id"] or None
     final_price = float(record["current_highest_bid"]) if winner_id else 0.0
     premium, escrow_status = assistant.compute_settlement(final_price, winner_id is not None, premium_percent)
-    database.create_settlement(
+    if not database.create_settlement(
         record["auction_id"], winner_id, record["seller_id"], final_price, premium, escrow_status, now_ms=now_ms
-    )
-    if winner_id:
+    ):
+        return  # already settled
+    if winner_id is None:
+        log.info("settlement %s: no sale, nothing escrowed", record["auction_id"])
+        return
+    due = round(final_price + premium, 2)
+    if database.hold_in_escrow(record["auction_id"], winner_id, due, now_ms):
         log.info(
-            "settlement %s: %s escrowed from %s (%s + %s buyer's premium), released to %s on hand-over [mock]",
-            record["auction_id"], assistant.money(final_price + premium), winner_id,
-            assistant.money(final_price), assistant.money(premium), record["seller_id"],
+            "settlement %s: %s moved from %s's wallet into escrow (%s + %s buyer's premium) [mock]",
+            record["auction_id"], assistant.money(due), winner_id,
+            assistant.money(final_price), assistant.money(premium),
         )
     else:
-        log.info("settlement %s: no sale, nothing escrowed", record["auction_id"])
+        # The funds check at bid time should make this impossible; if it ever
+        # happens the sale is marked, never paid from money that isn't there.
+        database.set_escrow_status(record["auction_id"], database.ESCROW_UNPAID)
+        log.warning("settlement %s: %s could not cover %s - marked unpaid", record["auction_id"], winner_id, due)
+
+
+def _deposit(cmd: dict) -> dict:
+    """Mock top-up. Exactly-once like bids: a retry with the same request id
+    gets the original answer and adds nothing."""
+    request_id = cmd.get("request_id") or ""
+    if request_id:
+        stored = database.get_request_result(cmd["user_id"], request_id)
+        if stored is not None:
+            return {**json.loads(stored), "replayed": True}
+    balance = database.deposit(cmd["user_id"], cmd["amount"], cmd["now_ms"])
+    result = {"ok": True, "balance": balance} if balance is not None else {"ok": False, "error": "No wallet for this user"}
+    if request_id:
+        database.save_request_result(cmd["user_id"], request_id, json.dumps(result))
+    return result
+
+
+def _confirm_receipt(cmd: dict) -> dict:
+    """The winner confirms they received the item: escrow is released and the
+    seller is paid."""
+    released, message = database.release_escrow(cmd["auction_id"], cmd["user_id"], cmd["now_ms"])
+    if released:
+        log.info("escrow for auction %s released by %s - seller paid [mock]", cmd["auction_id"], cmd["user_id"])
+        return {"ok": True, "escrow_status": message}
+    return {"ok": False, "error": message}
 
 
 def _save_summary(cmd: dict) -> dict:
@@ -169,10 +243,13 @@ def _save_summary(cmd: dict) -> dict:
 
 
 _HANDLERS = {
+    "REGISTER": _register,
     "LOGIN": _login,
     "LOGOUT": _logout,
     "CREATE_AUCTION": _create_auction,
     "PLACE_BID": _place_bid,
     "CLOSE_EXPIRED": _close_expired,
     "SAVE_SUMMARY": _save_summary,
+    "DEPOSIT": _deposit,
+    "CONFIRM_RECEIPT": _confirm_receipt,
 }

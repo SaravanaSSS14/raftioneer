@@ -5,13 +5,20 @@ package raftioneer.llm;
 // Contract for the independent LLM server (Node 1). Called by app
 // servers over gRPC only; holds no authoritative auction state.
 
+// The assignment's getLLMAnswer(requestId, query, context) ->
+// getLLMAnswerResponse(requestId, answer). `question` is the query.
 message GetLLMAnswerRequest {
   string question = 1;
-  string context = 2; // relevant item/auction info injected by the app server
+  string context = 2;    // relevant item/auction info injected by the app server
+  string request_id = 3; // chosen by the app server; echoed back and logged on both sides
 }
 
 message GetLLMAnswerResponse {
   string answer = 1;
+  string request_id = 2; // the request's request_id
+  // Titles of the auction-handbook sections the answer was grounded in
+  // (retrieved by the LLM node), so a caller can show its sources.
+  repeated string sources = 3;
 }
 
 message GenerateItemDescriptionRequest {

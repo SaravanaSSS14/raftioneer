@@ -1,14 +1,15 @@
-"""The client-facing gRPC service: auth, listings, bidding, the assistant,
-and the cluster status.
+"""The client-facing gRPC service: accounts, listings, bidding, the
+assistant, the cluster status, and the assignment's generic post/get.
 
-Writes (Login, Logout, CreateAuction, PlaceBid) go through Raft - see the
-class docstring. Reads are served from this node's own copy of the state.
+Writes (Register, Login, Logout, CreateAuction, PlaceBid) go through Raft -
+see RaftWriter. Reads are served from this node's own copy of the state.
 """
 import asyncio
 import datetime
 import json
 import logging
 import math
+import re
 import uuid
 
 import grpc
@@ -19,7 +20,8 @@ import auction_pb2_grpc
 import state_machine
 from config import (
     ADDRESSES, ANTI_SNIPE_MAX_EXTENSION_SECONDS, ANTI_SNIPE_WINDOW_SECONDS, COMMIT_TIMEOUT_MESSAGE,
-    COMMIT_TIMEOUT_SECONDS, MAX_AUCTION_SECONDS, MAX_REQUEST_ID_LENGTH,
+    COMMIT_TIMEOUT_SECONDS, MAX_AUCTION_SECONDS, MAX_REQUEST_ID_LENGTH, MIN_PASSWORD_LENGTH, STATUS_LOG_TAIL,
+    USERNAME_PATTERN, WELCOME_CREDIT,
 )
 from llm_client import LLMClient
 from raft import NotLeader, ProposalTimeout, RaftNode
@@ -50,22 +52,18 @@ def auction_to_proto(record: dict) -> auction_pb2.Auction:
     )
 
 
-class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
-    """The auction service: auth, listings, bidding, and the assistant.
+class RaftWriter:
+    """Raft plumbing shared by every service with write RPCs (the auction
+    service and the payment service).
 
-    Writes (Login, Logout, CreateAuction, PlaceBid) go through Raft: only the
-    leader accepts them, turns each into a command in the replicated log, and
-    answers once a majority has stored it and it has been applied. A follower
-    answers a write with leader_hint instead. Reads are served by any node
-    from its own copy of the state, which may trail the leader's by a
-    heartbeat or so.
+    A write goes through Raft: only the leader accepts it, turns it into a
+    command in the replicated log, and answers once a majority has stored it
+    and it has been applied. A follower answers a write with leader_hint
+    instead. Reads are served by any node from its own copy of the state,
+    which may trail the leader's by a heartbeat or so.
     """
 
-    def __init__(self, node: RaftNode, llm: LLMClient | None = None):
-        self.node = node
-        self.llm = llm
-
-    # ---- Raft plumbing shared by the write RPCs ----
+    node: RaftNode
 
     def _leader_hint(self) -> str:
         return ADDRESSES.get(self.node.leader_id or "", "")
@@ -90,15 +88,61 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             raise result
         return result
 
-    # ---- Auth ----
+
+class AuctionServiceServicer(RaftWriter, auction_pb2_grpc.AuctionServiceServicer):
+    """The auction service: accounts, listings, bidding, the assistant, the
+    cluster status and the generic post/get front door."""
+
+    def __init__(self, node: RaftNode, llm: LLMClient | None = None):
+        self.node = node
+        self.llm = llm
+        self.business = None  # the post/get router, attached by main.py
+
+    # ---- Accounts ----
+
+    async def Register(self, request, context):
+        """Create an account. Its wallet opens with the welcome credit."""
+        try:
+            username = (request.username or "").strip()
+            password = request.password or ""
+            if not re.fullmatch(USERNAME_PATTERN, username):
+                return auction_pb2.RegisterResponse(
+                    success=False, error_message="Username must be 3-32 letters, digits, '_', '-' or '.'"
+                )
+            if len(password) < MIN_PASSWORD_LENGTH:
+                return auction_pb2.RegisterResponse(
+                    success=False, error_message=f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
+                )
+
+            await self._leader_ready()
+            if database.get_user(username) is not None:
+                return auction_pb2.RegisterResponse(success=False, error_message="Username already taken")
+
+            # PBKDF2 is deliberately slow: off the event loop, so it can't
+            # delay Raft heartbeats.
+            password_hash = await asyncio.to_thread(auth.hash_password, password)
+            user_id = f"user_{username}"
+            result = await self._commit(
+                "REGISTER", username=username, user_id=user_id, password_hash=password_hash,
+                welcome_credit=WELCOME_CREDIT,
+            )
+            if not result["ok"]:
+                return auction_pb2.RegisterResponse(success=False, error_message=result["error"])
+            log.info("registered %s", username)
+            return auction_pb2.RegisterResponse(success=True, user_id=user_id)
+
+        except NotLeader:
+            return auction_pb2.RegisterResponse(
+                success=False, error_message=self._not_leader_message(), leader_hint=self._leader_hint()
+            )
+        except ProposalTimeout:
+            return auction_pb2.RegisterResponse(success=False, error_message=COMMIT_TIMEOUT_MESSAGE)
+        except Exception:
+            log.exception("Register failed for %s", request.username)
+            return auction_pb2.RegisterResponse(success=False, error_message="Registration failed, please try again")
 
     async def Login(self, request, context):
-        """Log in, registering the username on first use.
-
-        The contract has no separate Register RPC, so the first successful
-        login for a username sets its password (stored as a salted hash) and
-        every later login must match it.
-        """
+        """Sign in to an existing account (create one with Register)."""
         try:
             username = request.username.strip() if request.username else ""
             password = request.password or ""
@@ -116,25 +160,20 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             # Password hashing is deliberately slow (PBKDF2); run it off the
             # event loop so a burst of logins can't delay Raft heartbeats long
             # enough for followers to think the leader has died.
-            if existing_user is None:
-                user_id = f"user_{username}"
-                password_hash = await asyncio.to_thread(auth.hash_password, password)
-            else:
-                matches = await asyncio.to_thread(
-                    auth.validate_password_stored, password, existing_user["password_hash"]
+            matches = existing_user is not None and await asyncio.to_thread(
+                auth.validate_password_stored, password, existing_user["password_hash"]
+            )
+            if not matches:
+                log.info("Login rejected for %s (%s)", username, "wrong password" if existing_user else "no such user")
+                return auction_pb2.LoginResponse(
+                    success=False, error_message="Invalid username or password",
+                    session_token="", user_id=""
                 )
-                if not matches:
-                    log.info("Login rejected - wrong password for %s", username)
-                    return auction_pb2.LoginResponse(
-                        success=False, error_message="Invalid username or password",
-                        session_token="", user_id=""
-                    )
-                user_id = existing_user["user_id"]
-                password_hash = ""  # existing user: nothing to register
+            user_id = existing_user["user_id"]
 
             session_token = auth.generate_session_token()
             result = await self._commit(
-                "LOGIN", username=username, user_id=user_id, password_hash=password_hash, session_token=session_token
+                "LOGIN", username=username, user_id=user_id, session_token=session_token
             )
             if not result["ok"]:
                 log.info("Login rejected for %s (%s)", username, result["error"])
@@ -303,6 +342,7 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                     bidder_id=session["user_id"],
                     amount=request.amount,
                     request_id=request.request_id,
+                    premium_percent=assistant.BUYERS_PREMIUM_PERCENT,
                 )
             replayed = bool(result.get("replayed"))
             if not result["ok"]:
@@ -372,7 +412,19 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
             last_applied=status["last_applied"],
             last_log_index=status["last_log_index"],
             applied_digest=status["applied_digest"],
+            recent_entries=[
+                auction_pb2.LogEntryView(index=e.index, term=e.term, **state_machine.describe(e.command))
+                for e in self.node.tail(STATUS_LOG_TAIL)
+            ],
         )
+
+    # ---- The assignment's post(token, type, data) / get(token, type, params) ----
+
+    async def Post(self, request, context):
+        return await self.business.post(request, context)
+
+    async def Get(self, request, context):
+        return await self.business.get(request, context)
 
     # ------------------------------------------------------------------
     # LLM-backed features. None of these sit on the bidding path, and every
@@ -394,7 +446,8 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
         """Bidder FAQ, answered by the LLM node with the auction's details
         injected as context (the LLM node holds no auction state itself)."""
         try:
-            if not database.validate_session(request.session_token):
+            session = database.validate_session(request.session_token)
+            if not session:
                 return auction_pb2.AskAssistantResponse(
                     success=False, error_message="Invalid or expired session token"
                 )
@@ -411,20 +464,37 @@ class AuctionServiceServicer(auction_pb2_grpc.AuctionServiceServicer):
                 bid_count = len(database.get_bids_for_auction(request.auction_id))
 
             now = now_ms()
+            # Context-aware: the asker's own wallet, so "how much can I bid?"
+            # is answered for them, not in general.
+            user_id = session["user_id"]
+            wallet = assistant.wallet_facts(
+                session["username"], database.get_wallet_balance(user_id) or 0.0,
+                database.committed_funds(user_id, assistant.BUYERS_PREMIUM_PERCENT), database.in_escrow(user_id),
+            )
 
             if self.llm is not None:
+                request_id = uuid.uuid4().hex[:12]
                 try:
-                    answer = await self.llm.get_answer(question, assistant.build_context(auction, bid_count, now))
+                    reply = await self.llm.get_answer(
+                        question, assistant.build_context(auction, bid_count, now, wallet), request_id=request_id
+                    )
+                    if reply.request_id and reply.request_id != request_id:
+                        log.warning("LLM reply for request %s came back as %s", request_id, reply.request_id)
+                    log.info("assistant request %s answered by the LLM node (sources: %s)",
+                             request_id, ", ".join(reply.sources) or "none")
+                    answer = reply.answer
                     if auction is not None:
                         # The model is fluent, not reliable: the facts a bidder acts on
                         # are restated underneath, straight from the auction.
                         answer = f"{answer}\n\n{assistant.fine_print(auction, bid_count, now)}"
-                    return auction_pb2.AskAssistantResponse(success=True, answer=answer, from_fallback=False)
+                    return auction_pb2.AskAssistantResponse(
+                        success=True, answer=answer, from_fallback=False, sources=list(reply.sources)
+                    )
                 except grpc.aio.AioRpcError as exc:
                     log.warning("LLM node unavailable for AskAssistant (%s) - answering from facts", exc.code())
 
             return auction_pb2.AskAssistantResponse(
-                success=True, answer=assistant.fallback_answer(auction, bid_count, now), from_fallback=True
+                success=True, answer=assistant.fallback_answer(auction, bid_count, now, wallet), from_fallback=True
             )
 
         except Exception:

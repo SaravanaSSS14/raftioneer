@@ -24,16 +24,18 @@ class LLMClient:
         self,
         question: str,
         context: str = "",
-    ) -> str:
-        response = await self._stub.GetLLMAnswer(
+        request_id: str = "",
+    ) -> llm_pb2.GetLLMAnswerResponse:
+        """getLLMAnswer(requestId, query, context) -> (requestId, answer),
+        plus the handbook sections the answer was grounded in."""
+        return await self._stub.GetLLMAnswer(
             llm_pb2.GetLLMAnswerRequest(
                 question=question,
                 context=context,
+                request_id=request_id,
             ),
             timeout=self._timeout_seconds,
         )
-
-        return response.answer
 
     async def generate_item_description(
         self,

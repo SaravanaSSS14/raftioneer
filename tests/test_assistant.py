@@ -199,3 +199,15 @@ def test_recap_fact_check_with_no_bids():
     assert assistant.recap_matches_facts("This auction saw zero bids, resulting in a final price of 0.00.", 0, 0.0)
     assert not assistant.recap_matches_facts("The fan sold after 2 bids.", 0, 0.0)
 
+
+
+def test_wallet_facts_state_the_largest_affordable_bid():
+    text = assistant.wallet_facts("asha", balance=5000.0, committed=4725.0, in_escrow=0.0, premium_percent=5.0)
+    assert "Available for a new bid: Rs 275.00" in text
+    assert "Largest new bid they can afford, including the 5% premium: Rs 261.90" in text
+
+
+def test_the_askers_wallet_reaches_the_context():
+    wallet = assistant.wallet_facts("asha", 1000.0, 0.0, 0.0)
+    text = assistant.build_context(_auction(), 0, NOW_MS, wallet)
+    assert "The person asking: asha" in text and "Item:" in text

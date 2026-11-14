@@ -33,6 +33,7 @@ from .prompts import (  # noqa: E402
     build_description_prompt,
     build_summary_prompt,
 )
+from .retrieval import Handbook  # noqa: E402
 
 
 
@@ -63,6 +64,11 @@ OLLAMA_MAX_OUTPUT_TOKENS = int(
 
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 
+# The domain model: built at startup from OLLAMA_MODEL with Tapri's persona
+# and house rules baked in as its system prompt (an Ollama Modelfile, made
+# through the API). "" = use the base model with the prompt sent per request.
+OLLAMA_CUSTOM_MODEL = os.environ.get("OLLAMA_CUSTOM_MODEL", "raftioneer-tapri")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,8 +81,9 @@ log = logging.getLogger(__name__)
 class LLMServiceServicer(
     llm_pb2_grpc.LLMServiceServicer
 ):
-    def __init__(self, llm_client: OllamaClient) -> None:
+    def __init__(self, llm_client: OllamaClient, handbook: Handbook | None = None) -> None:
         self.llm_client = llm_client
+        self.handbook = handbook if handbook is not None else Handbook()
 
     async def _generate(
         self,
@@ -114,9 +121,13 @@ class LLMServiceServicer(
                 "question is required",
             )
 
+        # Retrieval first: the handbook sections this question is about.
+        sections = self.handbook.search(question)
+
         prompt = build_answer_prompt(
             question,
             request.context,
+            sections,
         )
 
         answer = await self._generate(
@@ -125,12 +136,16 @@ class LLMServiceServicer(
         )
 
         log.info(
-            "GetLLMAnswer(question=%r) ok",
+            "GetLLMAnswer(request_id=%s, question=%r) ok - grounded in: %s",
+            request.request_id or "-",
             question,
+            ", ".join(s.title for s in sections) or "no handbook section",
         )
 
         return llm_pb2.GetLLMAnswerResponse(
-            answer=answer
+            answer=answer,
+            request_id=request.request_id,
+            sources=[s.title for s in sections],
         )
 
     async def GenerateItemDescription(
@@ -244,8 +259,12 @@ class LLMServiceServicer(
 
 
 async def warm_up(llm_client: OllamaClient) -> None:
-    """Load the model into memory at startup, so the first real question
-    doesn't wait for it. Harmless if it fails: the first request loads it."""
+    """Build the domain model (if configured), then load it into memory so
+    the first real question doesn't wait for it. Harmless if either fails:
+    the base model with a per-request system prompt still works, and the
+    first request loads it."""
+    if OLLAMA_CUSTOM_MODEL:
+        await llm_client.use_custom_model(OLLAMA_CUSTOM_MODEL, SYSTEM_PROMPT)
     started = time.monotonic()
     try:
         await llm_client.generate(
@@ -254,7 +273,7 @@ async def warm_up(llm_client: OllamaClient) -> None:
         )
         log.info(
             "model %s loaded and warm (%.1fs)",
-            OLLAMA_MODEL,
+            llm_client.model,
             time.monotonic() - started,
         )
     except OllamaClientError as exc:

@@ -32,9 +32,24 @@ def apply(op, **fields):
     return state_machine.apply(state_machine.encode(op, **fields))
 
 
-def login(username, password_hash="hash-1", token=None, now=T0):
+CREDIT = 1000.0  # the welcome credit in these tests
+PREMIUM = 5.0     # buyer's premium, percent
+
+
+def register(username, password_hash="hash-1", credit=CREDIT, now=T0):
     return apply(
-        "LOGIN", username=username, user_id=f"user_{username}", password_hash=password_hash,
+        "REGISTER", username=username, user_id=f"user_{username}", password_hash=password_hash,
+        welcome_credit=credit, now_ms=now,
+    )
+
+
+def login(username, token=None, now=T0):
+    """Register the user if they're new, then sign in - most tests just need
+    a user with a session and a wallet."""
+    if database.get_user(username) is None:
+        register(username, now=now)
+    return apply(
+        "LOGIN", username=username, user_id=f"user_{username}",
         session_token=token or f"tok-{username}", now_ms=now,
     )
 
@@ -50,7 +65,7 @@ def create(auction_id, seller="seller", duration=60, reserve=0.0, now=T0, snipe=
 def bid(auction_id, bidder, amount, bid_id, now=T0 + 1000, request_id=""):
     return apply(
         "PLACE_BID", auction_id=auction_id, bidder_id=f"user_{bidder}", amount=amount, bid_id=bid_id, now_ms=now,
-        request_id=request_id,
+        request_id=request_id, premium_percent=PREMIUM,
     )
 
 
@@ -72,6 +87,9 @@ SCRIPT = [
     lambda: create("a3", duration=60, snipe=10, cap=30),
     lambda: bid("a3", "ravi", 20.0, "b7", now=T0 + 55_000, request_id="r1"),  # extends the clock
     lambda: bid("a3", "ravi", 20.0, "b8", now=T0 + 56_000, request_id="r1"),  # a retry: replayed
+    lambda: apply("CONFIRM_RECEIPT", auction_id="a2", user_id="user_ravi", now_ms=T0 + 9000),  # escrow released
+    lambda: apply("DEPOSIT", user_id="user_asha", amount=250.0, request_id="d1", now_ms=T0 + 9500),
+    lambda: bid("a1", "asha", 1300.0, "b9", now=T0 + 9600),  # more than asha has
 ]
 
 
@@ -126,11 +144,19 @@ def test_a_late_bid_closes_the_auction_instead_of_counting(fresh_db):
     assert database.get_auction("a1")["status"] == "CLOSED"
 
 
-def test_racing_first_logins_for_one_username_register_it_once(fresh_db):
-    assert login("newbie", password_hash="hash-A", token="t1")["ok"]
-    assert not login("newbie", password_hash="hash-B", token="t2")["ok"]  # lost the race
+def test_racing_registrations_for_one_username_register_it_once(fresh_db):
+    assert register("newbie", password_hash="hash-A")["ok"]
+    assert register("newbie", password_hash="hash-B") == {"ok": False, "error": "Username already taken"}
     assert database.get_user("newbie")["password_hash"] == "hash-A"
-    assert login("newbie", password_hash="", token="t3")["ok"]  # a normal later login
+    assert database.get_wallet_balance("user_newbie") == CREDIT  # credited once, not twice
+    assert login("newbie", token="t1")["ok"]
+
+
+def test_login_never_creates_an_account(fresh_db):
+    result = apply("LOGIN", username="ghost", user_id="user_ghost", session_token="t", now_ms=T0)
+    assert result == {"ok": False, "error": "Invalid username or password"}
+    assert database.get_user("ghost") is None
+    assert database.validate_session("t") is None
 
 
 def test_unknown_commands_are_ignored(fresh_db):
@@ -236,3 +262,93 @@ def test_without_a_request_id_nothing_is_deduplicated(fresh_db):
     assert bid("a1", "asha", 10.0, "b1")["ok"]
     assert not bid("a1", "asha", 10.0, "b2")["ok"]  # judged afresh: not higher than 10
 
+
+
+# ---- mock payments: wallets, the funds check, escrow ----
+
+
+def balance(user):
+    return database.get_wallet_balance(f"user_{user}")
+
+
+def test_a_new_account_opens_with_the_welcome_credit(fresh_db):
+    register("asha")
+    assert balance("asha") == CREDIT
+    [txn] = database.list_transactions("user_asha")
+    assert (txn["kind"], txn["amount"], txn["balance_after"]) == ("WELCOME_CREDIT", CREDIT, CREDIT)
+
+
+def test_a_bid_needs_funds_for_the_price_plus_the_premium(fresh_db):
+    login("seller"), login("asha")
+    create("a1")
+    refused = bid("a1", "asha", 960.0, "b1")  # 960 + 5% = 1008 > 1000
+    assert not refused["ok"] and refused["message"].startswith("Insufficient funds")
+    assert bid("a1", "asha", 950.0, "b2")["ok"]  # 950 + 5% = 997.50
+
+
+def test_money_promised_to_a_winning_bid_cannot_be_bid_again(fresh_db):
+    login("seller"), login("asha")
+    create("a1"), create("a2")
+    assert bid("a1", "asha", 600.0, "b1")["ok"]  # promises 630
+    assert not bid("a2", "asha", 400.0, "b2")["ok"]  # needs 420, only 370 left
+    assert bid("a2", "asha", 350.0, "b3")["ok"]  # 367.50 fits
+    # Raising your own winning bid replaces that promise rather than adding to it.
+    assert not bid("a1", "asha", 650.0, "b4")["ok"]  # 682.50 > 1000 - 367.50
+    assert bid("a1", "asha", 600.5, "b5")["ok"]  # 630.53 fits
+
+
+def test_being_outbid_frees_the_money(fresh_db):
+    login("seller"), login("asha"), login("ravi")
+    create("a1"), create("a2")
+    assert bid("a1", "asha", 900.0, "b1")["ok"]
+    assert not bid("a2", "asha", 100.0, "b2")["ok"]
+    assert bid("a1", "ravi", 910.0, "b3")["ok"]  # asha is no longer winning a1
+    assert bid("a2", "asha", 100.0, "b4")["ok"]
+
+
+def test_settlement_moves_price_and_premium_into_escrow(fresh_db):
+    login("seller"), login("asha")
+    create("a1", duration=5)
+    bid("a1", "asha", 200.0, "b1")
+    apply("CLOSE_EXPIRED", now_ms=T0 + 6000, premium_percent=PREMIUM)
+    assert database.get_settlement("a1")["escrow_status"] == database.ESCROW_HELD
+    assert balance("asha") == CREDIT - 210.0
+    assert database.in_escrow("user_asha") == 210.0
+    assert database.list_transactions("user_asha")[0]["kind"] == "ESCROW_HOLD"
+
+
+def test_confirming_receipt_releases_escrow_to_the_seller(fresh_db):
+    login("seller"), login("asha"), login("ravi")
+    create("a1", duration=5)
+    bid("a1", "asha", 200.0, "b1")
+    apply("CLOSE_EXPIRED", now_ms=T0 + 6000, premium_percent=PREMIUM)
+
+    not_winner = apply("CONFIRM_RECEIPT", auction_id="a1", user_id="user_ravi", now_ms=T0 + 7000)
+    assert not_winner == {"ok": False, "error": "Only the winner can confirm receipt"}
+
+    assert apply("CONFIRM_RECEIPT", auction_id="a1", user_id="user_asha", now_ms=T0 + 7000)["ok"]
+    assert database.get_settlement("a1")["escrow_status"] == database.ESCROW_RELEASED
+    assert balance("seller") == CREDIT + 200.0  # the price; the premium stays with the house
+    assert database.in_escrow("user_asha") == 0.0
+
+    again = apply("CONFIRM_RECEIPT", auction_id="a1", user_id="user_asha", now_ms=T0 + 8000)
+    assert not again["ok"] and balance("seller") == CREDIT + 200.0  # paid once
+
+
+def test_a_retried_deposit_counts_once(fresh_db):
+    login("asha")
+    first = apply("DEPOSIT", user_id="user_asha", amount=500.0, request_id="d1", now_ms=T0)
+    retry = apply("DEPOSIT", user_id="user_asha", amount=500.0, request_id="d1", now_ms=T0 + 10)
+    assert first == {"ok": True, "balance": 1500.0}
+    assert retry == {"ok": True, "balance": 1500.0, "replayed": True}
+    assert balance("asha") == 1500.0
+
+
+def test_a_deposit_for_an_unknown_user_changes_nothing(fresh_db):
+    assert apply("DEPOSIT", user_id="user_nobody", amount=5.0, now_ms=T0)["ok"] is False
+
+
+def test_every_command_has_a_readable_label(fresh_db):
+    assert state_machine.describe(b"") == {"op": "NOOP", "label": "new leader's no-op"}
+    command = state_machine.encode("PLACE_BID", bidder_id="user_asha", amount=120.0)
+    assert state_machine.describe(command) == {"op": "PLACE_BID", "label": "asha bids Rs 120.00"}

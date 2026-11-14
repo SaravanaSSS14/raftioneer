@@ -28,6 +28,7 @@ import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader, statuses, wait_until_replicated
 import narrate
+from accounts import sign_in
 from narrate import aside
 
 COMPOSE = ["docker", "compose", "-f", "deploy/docker-compose.yml"]
@@ -38,8 +39,10 @@ def stub_for(address: str):
     return auction_pb2_grpc.AuctionServiceStub(grpc.insecure_channel(address))
 
 
-def login(stub, username: str) -> str:
-    resp = stub.Login(auction_pb2.LoginRequest(username=username, password="failover123"), timeout=TIMEOUT)
+def login(address: str, username: str) -> str:
+    # Its bids start at Rs 10,000, so the wallet is topped up well past that.
+    with grpc.insecure_channel(address) as channel:
+        resp = sign_in(channel, username, "failover123", funds=50_000, timeout=TIMEOUT)
     if not resp.success:
         raise SystemExit(f"login failed for {username}: {resp.error_message}")
     return resp.session_token
@@ -80,8 +83,8 @@ def main() -> int:
     term_before = next(s.term for a, s in statuses([leader]) if s is not None)
     print(f"   leader: {leader_node} at {leader} (term {term_before})")
     stub = stub_for(leader)
-    seller = login(stub, "failover_seller")
-    bidders = [login(stub, "failover_bidder_a"), login(stub, "failover_bidder_b")]
+    seller = login(leader, "failover_seller")
+    bidders = [login(leader, "failover_bidder_a"), login(leader, "failover_bidder_b")]
     created = stub.CreateAuction(
         auction_pb2.CreateAuctionRequest(
             session_token=seller, title="Failover-check item", description="Created by scripts/failover_check.py",

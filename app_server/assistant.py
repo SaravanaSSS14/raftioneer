@@ -33,8 +33,10 @@ def platform_rules() -> str:
         "How this auction works: a bid must be higher than the current highest bid, "
         "and at least the reserve price if the seller set one. An auction closes "
         "automatically at its end time and the highest bid wins. The winner pays their "
-        f"bid plus a {BUYERS_PREMIUM_PERCENT:g}% buyer's premium; payment is a mock "
-        "escrow hold, so no real money moves."
+        f"bid plus a {BUYERS_PREMIUM_PERCENT:g}% buyer's premium from their wallet, so a bid "
+        "needs that much in available funds. The payment is held in escrow until the "
+        "winner confirms receipt of the item; then the seller is paid. All money is mock "
+        "money - nothing real is charged."
     )
 
 
@@ -78,18 +80,37 @@ def auction_facts(auction: dict, bid_count: int, now_ms: float) -> str:
     return "\n".join(lines)
 
 
-def build_context(auction: Optional[dict], bid_count: int, now_ms: float) -> str:
-    """Reference context for an LLM answer: the rules, plus the auction if given."""
-    if auction is None:
-        return platform_rules()
-    return f"{auction_facts(auction, bid_count, now_ms)}\n\n{platform_rules()}"
+def wallet_facts(username: str, balance: float, committed: float, in_escrow: float,
+                 premium_percent: float = BUYERS_PREMIUM_PERCENT) -> str:
+    """The asker's own wallet, with the largest bid they can afford already
+    worked out - the model is not trusted with that arithmetic."""
+    available = max(balance - committed, 0.0)
+    largest = available / (1 + premium_percent / 100.0)
+    return "\n".join([
+        f"The person asking: {username}",
+        f"Their wallet balance: {money(balance)}",
+        f"Promised to auctions they are winning (bids + premium): {money(committed)}",
+        f"Available for a new bid: {money(available)}",
+        f"Largest new bid they can afford, including the {premium_percent:g}% premium: {money(largest)}",
+        f"Held in escrow for items they won: {money(in_escrow)}",
+    ])
 
 
-def fallback_answer(auction: Optional[dict], bid_count: int, now_ms: float) -> str:
+def build_context(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "") -> str:
+    """Reference context for an LLM answer: the rules, plus the auction and
+    the asker's wallet if given."""
+    parts = [auction_facts(auction, bid_count, now_ms)] if auction is not None else []
+    if wallet:
+        parts.append(wallet)
+    parts.append(platform_rules())
+    return "\n\n".join(parts)
+
+
+def fallback_answer(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "") -> str:
     return (
         "Tapri is offline on a chai break (the LLM node isn't answering), so here are the plain "
         "facts - less charming, entirely accurate.\n"
-        + build_context(auction, bid_count, now_ms)
+        + build_context(auction, bid_count, now_ms, wallet)
     )
 
 

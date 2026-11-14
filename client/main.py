@@ -44,7 +44,7 @@ OUTBID_REACTIONS = [
     "{name} was outbid, and is recalculating the month's chai budget.",
 ]
 
-# Writes (Login, PlaceBid) must go to the Raft leader; reads can go to any app
+# Writes (Register, Login, PlaceBid, Deposit) must go to the Raft leader; reads can go to any app
 # server. The client remembers the leader, follows a follower's leader_hint
 # when the leader changes, and asks the cluster again if the leader goes quiet.
 _channels: dict[str, grpc.aio.Channel] = {}
@@ -52,10 +52,33 @@ _leader: str | None = None
 _sessions: dict[str, str] = {}  # username -> session token
 
 
+# Each persona keeps at least this much in their (mock) wallet: a bid needs
+# its price plus the buyer's premium in available funds, and auctions they win
+# move money into escrow.
+PERSONA_FUNDS = 10_000.0
+
+
 def stub(address: str) -> auction_pb2_grpc.AuctionServiceStub:
     if address not in _channels:
         _channels[address] = grpc.aio.insecure_channel(address)
     return auction_pb2_grpc.AuctionServiceStub(_channels[address])
+
+
+def payments(address: str) -> auction_pb2_grpc.PaymentServiceStub:
+    stub(address)  # opens the channel if needed
+    return auction_pb2_grpc.PaymentServiceStub(_channels[address])
+
+
+async def top_up(leader: str, username: str, token: str) -> None:
+    """Bring the persona's wallet back up to PERSONA_FUNDS (a mock deposit)."""
+    wallet = await payments(leader).GetWallet(auction_pb2.WalletRequest(session_token=token), timeout=3)
+    if wallet.success and wallet.balance < PERSONA_FUNDS:
+        await payments(leader).Deposit(
+            auction_pb2.DepositRequest(session_token=token, amount=round(PERSONA_FUNDS - wallet.balance, 2),
+                                       request_id=uuid.uuid4().hex),
+            timeout=3,
+        )
+        log.info("%s topped up their wallet to %.2f", username, PERSONA_FUNDS)
 
 
 async def find_leader() -> str | None:
@@ -78,8 +101,14 @@ def follow_hint(hint: str) -> None:
 
 
 async def session_for(leader: str, username: str, password: str) -> str | None:
+    """The persona's session: registered on first use, logged in once, wallet topped up."""
     if username in _sessions:
         return _sessions[username]
+    registered = await stub(leader).Register(
+        auction_pb2.RegisterRequest(username=username, password=password), timeout=3
+    )
+    if registered.success:
+        log.info("%s: registered %s", leader, username)
     resp = await stub(leader).Login(auction_pb2.LoginRequest(username=username, password=password), timeout=3)
     if not resp.success:
         if resp.leader_hint:
@@ -88,6 +117,7 @@ async def session_for(leader: str, username: str, password: str) -> str | None:
         return None
     log.info("%s: logged in as %s", leader, username)
     _sessions[username] = resp.session_token
+    await top_up(leader, username, resp.session_token)
     return resp.session_token
 
 
@@ -144,6 +174,8 @@ async def run_bidder_cycle(persona: tuple) -> None:
             follow_hint(bid_resp.leader_hint)
         elif "session" in bid_resp.error_message.lower():
             _sessions.pop(username, None)  # expired or replaced: log in again next time
+        elif bid_resp.error_message.startswith("Insufficient funds"):
+            await top_up(leader, username, token)
         log.info("%s: %s's bid rejected (%s)", leader, username, bid_resp.error_message or "no reason given")
         if not SERIOUS and "greater than" in bid_resp.error_message:
             log.info("  ~ %s", random.choice(OUTBID_REACTIONS).format(name=username))

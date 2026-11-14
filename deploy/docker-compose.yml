@@ -18,8 +18,9 @@ services:
   # service so `docker compose up` is fully self-contained: nothing needs
   # to be installed on the host. The model is downloaded once into a
   # named volume; later runs start immediately.
+  # Pinned to an exact version, so a fresh machine runs what was tested.
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.34.4
     volumes:
       - ollama_models:/root/.ollama
     healthcheck:
@@ -32,7 +33,7 @@ services:
   # Downloads the model once. If it is already in the volume, it does nothing -
   # so the LLM node also starts with no internet access (an exam hall, say).
   ollama_pull:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.34.4
     entrypoint: ["/bin/sh", "-c", "ollama list | grep -q '^qwen2.5:1.5b' || ollama pull qwen2.5:1.5b"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
@@ -51,6 +52,9 @@ services:
       - PORT=50060
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=qwen2.5:1.5b
+      # The domain model the node builds from it at startup: Tapri's persona
+      # and house rules baked in (see llm_server/ollama_client.py).
+      - OLLAMA_CUSTOM_MODEL=raftioneer-tapri
       - OLLAMA_TIMEOUT_SECONDS=90
       - OLLAMA_KEEP_ALIVE=30m
     depends_on:

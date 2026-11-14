@@ -42,6 +42,21 @@ message Auction {
 }
 
 // ---- Auth ----
+// An account is created once with Register; Login only signs in an existing
+// account. Every new account is opened with a mock welcome credit in its
+// wallet (see PaymentService below).
+
+message RegisterRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string user_id = 2;
+  string error_message = 3; // e.g. "Username already taken"
+  string leader_hint = 4;   // set when this node is not the Raft leader: where to retry
+}
 
 message LoginRequest {
   string username = 1;
@@ -117,6 +132,7 @@ message AskAssistantResponse {
   string answer = 2;
   bool from_fallback = 3; // true if the LLM node was unavailable and a plain-text answer was returned instead
   string error_message = 4;
+  repeated string sources = 5; // auction-handbook sections the LLM node grounded the answer in
 }
 
 message GetAuctionSummaryRequest {
@@ -187,17 +203,69 @@ message ClusterStatusResponse {
   // order). Two nodes with the same last_applied and the same digest have fed
   // their state machines exactly the same input.
   string applied_digest = 9;
+  // The last few entries of this node's log, oldest first - what the demo UI
+  // draws as each node's log, so replication can be watched entry by entry.
+  repeated LogEntryView recent_entries = 10;
+}
+
+message LogEntryView {
+  int64 index = 1;
+  int64 term = 2;
+  string op = 3;     // the command, e.g. PLACE_BID; NOOP for a new leader's no-op
+  string label = 4;  // a short human-readable line, e.g. "bid Rs 120 on 3fa2c1d0"
+}
+
+// ---- The assignment's generic client API ----
+// post(token, type, data) and get(token, type, params), as given in the
+// assignment's function signatures. Each is a front door onto the typed RPCs:
+// the app server's ProcessBusinessRequest routes it by `type` to the same code
+// that serves PlaceBid, CreateAuction, GetWallet, and so on.
+
+message PostRequest {
+  string token = 1;
+  string type = 2;        // "bid", "auction", "deposit", "confirm_receipt"
+  string data = 3;        // a JSON object, e.g. {"auction_id": "3fa2c1d0", "amount": 120}
+  string request_id = 4;  // optional; makes a bid or a deposit exactly-once
+}
+
+message PostResponse {
+  string status = 1;      // OK, REJECTED, NOT_LEADER, UNAUTHENTICATED, INVALID or ERROR
+  string message = 2;
+  string id = 3;          // the id of what was created, if anything
+  string leader_hint = 4;
+  string data = 5;        // the typed RPC's full reply, as JSON
+}
+
+message GetRequest {
+  string token = 1;       // needed for "wallet" and "transactions"; ignored otherwise
+  string type = 2;        // "auctions", "auction", "bids", "summary", "wallet", "transactions", "cluster"
+  map<string, string> params = 3; // e.g. {"auction_id": "3fa2c1d0"} or {"status": "ACTIVE"}
+}
+
+message DataItem {
+  string id = 1;
+  string data = 2;        // JSON
+}
+
+message GetResponse {
+  string status = 1;      // OK, NOT_FOUND, UNAUTHENTICATED, INVALID or ERROR
+  repeated DataItem items = 2;
+  string message = 3;
 }
 
 service AuctionService {
+  // Create an account (with a mock welcome credit). Leader only.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Login(LoginRequest) returns (LoginResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc ListAuctions(ListAuctionsRequest) returns (ListAuctionsResponse);
   rpc GetAuction(GetAuctionRequest) returns (GetAuctionResponse);
   rpc CreateAuction(CreateAuctionRequest) returns (CreateAuctionResponse);
-  // Must beat the highest bid and meet any reserve; sellers cannot bid on
-  // their own auctions. Only the Raft leader accepts writes (Login, Logout,
-  // CreateAuction, PlaceBid); a follower replies with leader_hint set instead.
+  // Must beat the highest bid and meet any reserve, and the bidder must have
+  // the funds (see PaymentService); sellers cannot bid on their own auctions.
+  // Only the Raft leader accepts writes (Register, Login, Logout,
+  // CreateAuction, PlaceBid, Deposit, ConfirmReceipt); a follower replies with
+  // leader_hint set instead.
   rpc PlaceBid(PlaceBidRequest) returns (PlaceBidResponse);
   // Bidder FAQ, answered by the LLM node with the auction's details injected
   // as context. Never blocks or affects bidding; falls back to plain text.
@@ -208,4 +276,82 @@ service AuctionService {
   rpc ListBids(ListBidsRequest) returns (ListBidsResponse);
   // This node's Raft role, term and view of the leader. Served by every node.
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // The assignment's post(token, type, data) / get(token, type, params).
+  rpc Post(PostRequest) returns (PostResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+}
+
+// ---- Payments (mock) ----
+// A wallet per user, and an escrow step for every sale. No real money moves:
+// balances are numbers in the replicated state, changed only by committed
+// Raft commands, so every node holds the same wallets.
+//
+//   register          wallet opened with a welcome credit
+//   Deposit           mock top-up
+//   PlaceBid          refused if the bid (plus buyer's premium) is more than
+//                     the bidder's available funds - money already promised
+//                     to auctions they are winning is not available
+//   auction closes    the winner's price + premium moves into escrow (HELD)
+//   ConfirmReceipt    the winner confirms hand-over: escrow is RELEASED and
+//                     the seller is paid the price (the premium is the house's)
+
+message WalletRequest {
+  string session_token = 1;
+}
+
+message WalletResponse {
+  bool success = 1;
+  string error_message = 2;
+  string user_id = 3;
+  double balance = 4;     // money in the wallet (escrowed money has already left it)
+  double committed = 5;   // promised to auctions this user is currently winning (price + premium)
+  double available = 6;   // balance - committed: the most a new bid can use
+  double in_escrow = 7;   // paid into escrow for won auctions, awaiting hand-over
+}
+
+message DepositRequest {
+  string session_token = 1;
+  double amount = 2;
+  string request_id = 3;  // optional; a retried deposit with the same id counts once
+}
+
+message DepositResponse {
+  bool success = 1;
+  string error_message = 2;
+  double balance = 3;
+  string leader_hint = 4;
+}
+
+message ConfirmReceiptRequest {
+  string session_token = 1;
+  string auction_id = 2;
+}
+
+message ConfirmReceiptResponse {
+  bool success = 1;
+  string error_message = 2;
+  string escrow_status = 3;
+  string leader_hint = 4;
+}
+
+message Transaction {
+  int64 txn_id = 1;
+  string kind = 2;          // WELCOME_CREDIT, DEPOSIT, ESCROW_HOLD, SALE_PROCEEDS
+  double amount = 3;        // + money in, - money out
+  string auction_id = 4;    // "" if not about an auction
+  double balance_after = 5;
+  int64 timestamp_ms = 6;
+}
+
+message ListTransactionsResponse {
+  bool success = 1;
+  string error_message = 2;
+  repeated Transaction transactions = 3; // newest first
+}
+
+service PaymentService {
+  rpc GetWallet(WalletRequest) returns (WalletResponse);
+  rpc Deposit(DepositRequest) returns (DepositResponse);
+  rpc ConfirmReceipt(ConfirmReceiptRequest) returns (ConfirmReceiptResponse);
+  rpc ListTransactions(WalletRequest) returns (ListTransactionsResponse);
 }

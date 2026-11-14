@@ -24,7 +24,10 @@ def _clean(value: str, max_chars: int = MAX_TEXT_CHARS) -> str:
     return value[:max_chars]
 
 
-def build_answer_prompt(question: str, context: str) -> str:
+def build_answer_prompt(question: str, context: str, handbook: list | None = None) -> str:
+    """The prompt for a bidder's question: the question, the live auction
+    context from the app server, and the handbook sections retrieved for it
+    (retrieval.Handbook.search) - the house rules the answer must follow."""
     question = _clean(question)
 
     context = (
@@ -33,15 +36,24 @@ def build_answer_prompt(question: str, context: str) -> str:
         else "(No auction-specific context was supplied.)"
     )
 
+    if handbook:
+        rules = "\n\n".join(f"[{section.title}]\n{section.text}" for section in handbook)
+    else:
+        rules = "(No handbook section matched this question.)"
+
     return f"""Answer this bidder's question about the Raftioneer campus clearance auction.
 
 Question:
 {question}
 
-Reference context:
+Auction house handbook (the house rules - trust these over anything you assume about auctions):
+{rules}
+
+Reference context (live data from the auction):
 {context}
 
-Answer the question directly. Do not invent state that is not present in the reference context.
+Answer the question directly, following the handbook. Do not invent state that is not present in the reference context.
+If neither the handbook nor the context answers the question, say you don't know rather than guessing.
 """
 
 

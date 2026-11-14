@@ -121,7 +121,8 @@ def init_database():
                 final_price REAL NOT NULL,
                 buyers_premium REAL NOT NULL,
                 escrow_status TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                released_at INTEGER
             )
         """)
 
@@ -144,6 +145,29 @@ def init_database():
                 auction_id TEXT PRIMARY KEY,
                 summary TEXT NOT NULL,
                 from_fallback INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        # Mock payments. One wallet per user; `balance` is the money in it
+        # (money paid into escrow has already left). Every change is also a
+        # row in `transactions`, so a wallet can always be explained. Both
+        # tables are only ever written by applying committed Raft commands,
+        # in log order, so txn_id is the same on every node.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id TEXT PRIMARY KEY,
+                balance REAL NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                txn_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                amount REAL NOT NULL,
+                auction_id TEXT,
+                balance_after REAL NOT NULL,
                 created_at INTEGER NOT NULL
             )
         """)
@@ -307,8 +331,13 @@ def create_item(item_id: str, title: str, description: str, seller_id: str,
 
 
 def create_bid(auction_id: str, bidder_id: str, amount: float,
-               now_ms: Optional[int] = None, bid_id: Optional[str] = None) -> tuple[bool, str]:
+               now_ms: Optional[int] = None, bid_id: Optional[str] = None,
+               available_funds: Optional[float] = None, premium_percent: float = 0.0) -> tuple[bool, str]:
     """Record a bid if it is valid. Returns (accepted, bid_id or the reason it was refused).
+
+    available_funds, if given, is what the bidder can still spend (see
+    available_funds()); a bid whose price plus buyer's premium is more than
+    that is refused. None skips the check (the unit tests of the bid rules).
 
     Under Raft the time and bid id come from the replicated command, so every
     node reaches the same verdict on the same bid.
@@ -348,6 +377,14 @@ def create_bid(auction_id: str, bidder_id: str, amount: float,
 
         if amount < (auction["reserve_price"] or 0.0):
             return False, f"Bid does not meet reserve price ({auction['reserve_price']})"
+
+        if available_funds is not None:
+            needed = round(amount * (1 + premium_percent / 100.0), 2)
+            if needed > available_funds + 0.005:
+                return False, (
+                    f"Insufficient funds: this bid needs Rs {needed:,.2f} with the buyer's premium, "
+                    f"and you have Rs {max(available_funds, 0.0):,.2f} available"
+                )
 
         raised = conn.execute("""
             UPDATE auctions SET current_highest_bid = ?, current_highest_bidder_id = ?
@@ -581,5 +618,176 @@ def get_summary(auction_id: str) -> Optional[dict]:
     try:
         row = conn.execute("SELECT * FROM auction_summaries WHERE auction_id = ?", (auction_id,)).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- payments (mock)
+# Called only from the state machine, while applying committed commands - so
+# the same calls happen in the same order on every node.
+
+# Settlement states. HELD and NO_SALE match assistant.ESCROW_HELD / ESCROW_NO_SALE.
+ESCROW_HELD = "HELD (mock)"
+ESCROW_RELEASED = "RELEASED (mock)"
+ESCROW_UNPAID = "UNPAID (mock)"
+
+
+def create_wallet(user_id: str, opening_credit: float, now_ms: int) -> None:
+    """Open a user's wallet, crediting the welcome amount (if any)."""
+    conn = get_connection()
+    try:
+        conn.execute("INSERT OR IGNORE INTO wallets (user_id, balance) VALUES (?, 0)", (user_id,))
+        if opening_credit > 0:
+            _move_money(conn, user_id, opening_credit, "WELCOME_CREDIT", None, now_ms)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _move_money(conn: sqlite3.Connection, user_id: str, amount: float, kind: str,
+                auction_id: Optional[str], now_ms: int) -> float:
+    """Add `amount` (negative = take it out) to a wallet and record it. Returns
+    the new balance. The caller commits."""
+    conn.execute("UPDATE wallets SET balance = ROUND(balance + ?, 2) WHERE user_id = ?", (amount, user_id))
+    balance = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (user_id,)).fetchone()["balance"]
+    conn.execute("""
+        INSERT INTO transactions (user_id, kind, amount, auction_id, balance_after, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, kind, round(amount, 2), auction_id, balance, now_ms))
+    return balance
+
+
+def deposit(user_id: str, amount: float, now_ms: int) -> Optional[float]:
+    """Mock top-up. Returns the new balance, or None if the user has no wallet."""
+    conn = get_connection()
+    try:
+        if conn.execute("SELECT 1 FROM wallets WHERE user_id = ?", (user_id,)).fetchone() is None:
+            return None
+        balance = _move_money(conn, user_id, amount, "DEPOSIT", None, now_ms)
+        conn.commit()
+        return balance
+    finally:
+        conn.close()
+
+
+def get_wallet_balance(user_id: str) -> Optional[float]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+        return float(row["balance"]) if row else None
+    finally:
+        conn.close()
+
+
+def committed_funds(user_id: str, premium_percent: float, exclude_auction_id: Optional[str] = None) -> float:
+    """Money promised to auctions this user is currently winning: each
+    leading bid plus its buyer's premium. A new bid on one of them replaces
+    the old promise, hence exclude_auction_id."""
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(current_highest_bid), 0) AS total FROM auctions
+            WHERE status = 'ACTIVE' AND current_highest_bidder_id = ? AND auction_id != ?
+        """, (user_id, exclude_auction_id or "")).fetchone()
+        return round(float(row["total"]) * (1 + premium_percent / 100.0), 2)
+    finally:
+        conn.close()
+
+
+def available_funds(user_id: str, premium_percent: float, exclude_auction_id: Optional[str] = None) -> float:
+    """What a new bid can use: the balance less what is already promised. 0
+    for a user with no wallet."""
+    balance = get_wallet_balance(user_id)
+    if balance is None:
+        return 0.0
+    return round(balance - committed_funds(user_id, premium_percent, exclude_auction_id), 2)
+
+
+def in_escrow(user_id: str) -> float:
+    """Money this user has paid into escrow for won auctions not yet handed over."""
+    conn = get_connection()
+    try:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(final_price + buyers_premium), 0) AS total FROM settlements
+            WHERE winner_id = ? AND escrow_status = ?
+        """, (user_id, ESCROW_HELD)).fetchone()
+        return round(float(row["total"]), 2)
+    finally:
+        conn.close()
+
+
+def hold_in_escrow(auction_id: str, winner_id: str, amount: float, now_ms: int) -> bool:
+    """Move the winner's price + premium from their wallet into escrow. False
+    (nothing moved) if the wallet can't cover it - the funds check at bid time
+    means that shouldn't happen, but a settlement must never go negative."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT balance FROM wallets WHERE user_id = ?", (winner_id,)).fetchone()
+        if row is None or row["balance"] + 0.005 < amount:
+            return False
+        _move_money(conn, winner_id, -amount, "ESCROW_HOLD", auction_id, now_ms)
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def release_escrow(auction_id: str, user_id: str, now_ms: int) -> tuple[bool, str]:
+    """The winner confirms hand-over: escrow is released and the seller is
+    paid the final price (the buyer's premium stays with the auction house).
+    Returns (released, escrow status or the reason it was refused)."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM settlements WHERE auction_id = ?", (auction_id,)).fetchone()
+        if row is None:
+            return False, "This auction has not been settled yet"
+        if row["winner_id"] != user_id:
+            return False, "Only the winner can confirm receipt"
+        if row["escrow_status"] != ESCROW_HELD:
+            return False, f"Nothing to release: escrow is {row['escrow_status']}"
+        conn.execute(
+            "UPDATE settlements SET escrow_status = ?, released_at = ? WHERE auction_id = ?",
+            (ESCROW_RELEASED, now_ms, auction_id),
+        )
+        conn.execute("INSERT OR IGNORE INTO wallets (user_id, balance) VALUES (?, 0)", (row["seller_id"],))
+        _move_money(conn, row["seller_id"], float(row["final_price"]), "SALE_PROCEEDS", auction_id, now_ms)
+        conn.commit()
+        return True, ESCROW_RELEASED
+    finally:
+        conn.close()
+
+
+def set_escrow_status(auction_id: str, status: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE settlements SET escrow_status = ? WHERE auction_id = ?", (status, auction_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_transactions(user_id: str, limit: int = 50) -> list[dict]:
+    """A user's wallet history, newest first."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE user_id = ? ORDER BY txn_id DESC LIMIT ?", (user_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_settlements_won_by(user_id: str) -> list[dict]:
+    """Settled auctions this user won, newest first, with the item title."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT s.*, i.title FROM settlements s
+            JOIN auctions a ON a.auction_id = s.auction_id
+            JOIN items i ON a.item_id = i.item_id
+            WHERE s.winner_id = ? ORDER BY s.created_at DESC
+        """, (user_id,)).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

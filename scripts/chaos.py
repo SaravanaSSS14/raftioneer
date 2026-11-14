@@ -50,6 +50,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS
+from accounts import sign_in_async
 from consistency_check import check
 import narrate
 from narrate import aside
@@ -258,8 +259,10 @@ async def main_async(args) -> int:
     await cluster.wait_stable()
     leader_address, leader = await cluster.leader()
     stub = cluster.stub(leader_address)
-    seller = await stub.Login(auction_pb2.LoginRequest(username="chaos_seller", password="chaos12345"), timeout=5)
-    bidder = await stub.Login(auction_pb2.LoginRequest(username="chaos_bidder", password="chaos12345"), timeout=5)
+    channel = cluster.channels[leader_address]
+    seller = await sign_in_async(channel, "chaos_seller", "chaos12345", timeout=5)
+    # bids start at Rs 1,00,000 and rise by 10 each
+    bidder = await sign_in_async(channel, "chaos_bidder", "chaos12345", funds=500_000, timeout=5)
     created = await stub.CreateAuction(
         auction_pb2.CreateAuctionRequest(
             session_token=seller.session_token, title="Chaos-run item",

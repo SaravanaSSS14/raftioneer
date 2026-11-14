@@ -17,6 +17,7 @@ Run with the stack already up:
     ./scripts/generate_protos.sh
     pytest tests/
 """
+import json
 import os
 import time
 import uuid
@@ -129,16 +130,34 @@ def test_llm_get_answer_responds(llm_stub):
 # ---- Assistant, settlement and recap ----
 
 
-def _login(username):
-    """Log in through the leader; the session is then valid on every node."""
+TEST_FUNDS = 1_000_000.0  # the tests bid far above the welcome credit
+
+
+def _login(username, funds=TEST_FUNDS):
+    """Register (if new) and log in through the leader, with the wallet
+    topped up to at least `funds`; the session is then valid on every node."""
     with grpc.insecure_channel(_leader_address()) as channel:
-        resp = auction_pb2_grpc.AuctionServiceStub(channel).Login(
+        stub = auction_pb2_grpc.AuctionServiceStub(channel)
+        stub.Register(
+            auction_pb2.RegisterRequest(username=username, password="pytest-pw-123"), timeout=APP_TIMEOUT_SECONDS
+        )
+        resp = stub.Login(
             auction_pb2.LoginRequest(username=username, password="pytest-pw-123"),
             timeout=APP_TIMEOUT_SECONDS,
         )
-    assert resp.success, resp.error_message
+        assert resp.success, resp.error_message
+        payments = auction_pb2_grpc.PaymentServiceStub(channel)
+        wallet = payments.GetWallet(auction_pb2.WalletRequest(session_token=resp.session_token),
+                                    timeout=APP_TIMEOUT_SECONDS)
+        if wallet.balance < funds:
+            payments.Deposit(auction_pb2.DepositRequest(session_token=resp.session_token,
+                                                        amount=funds - wallet.balance), timeout=APP_TIMEOUT_SECONDS)
     _wait_replicated()
     return resp
+
+
+def _payments(address):
+    return auction_pb2_grpc.PaymentServiceStub(grpc.insecure_channel(address))
 
 
 def _wait_for_recap(stub, auction_id, timeout_seconds=120):
@@ -265,6 +284,23 @@ def test_closed_auction_reports_winner_settlement_and_recap(single_stub):
     assert result.escrow_status.startswith("HELD")
     assert result.summary.strip()
 
+    # The winner confirms the hand-over: escrow is released, the seller paid.
+    payments = _payments(_leader_address())
+    seller_before = payments.GetWallet(auction_pb2.WalletRequest(session_token=seller), timeout=APP_TIMEOUT_SECONDS)
+    not_winner = payments.ConfirmReceipt(
+        auction_pb2.ConfirmReceiptRequest(session_token=low.session_token, auction_id=created.auction_id),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert not not_winner.success
+    confirmed = payments.ConfirmReceipt(
+        auction_pb2.ConfirmReceiptRequest(session_token=high.session_token, auction_id=created.auction_id),
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert confirmed.success, confirmed.error_message
+    assert confirmed.escrow_status.startswith("RELEASED")
+    seller_after = payments.GetWallet(auction_pb2.WalletRequest(session_token=seller), timeout=APP_TIMEOUT_SECONDS)
+    assert seller_after.balance == pytest.approx(seller_before.balance + 55_000.0)
+
 
 def test_closed_auction_with_no_bids_is_a_no_sale(single_stub):
     # A reserve beyond every persona's budget keeps the client node from bidding;
@@ -309,13 +345,18 @@ def test_followers_refuse_writes_and_point_at_the_leader():
                 auction_pb2.LoginRequest(username="pytest-redirect", password="pytest-pw-123"),
                 timeout=APP_TIMEOUT_SECONDS,
             )
+            register = stub.Register(
+                auction_pb2.RegisterRequest(username="pytest-redirect", password="pytest-pw-123"),
+                timeout=APP_TIMEOUT_SECONDS,
+            )
             bid = stub.PlaceBid(
                 auction_pb2.PlaceBidRequest(session_token="x", auction_id="y", amount=1.0),
                 timeout=APP_TIMEOUT_SECONDS,
             )
         assert not login.success and login.leader_hint
+        assert not register.success and register.leader_hint
         assert not bid.accepted and bid.leader_hint
-        assert login.leader_hint == bid.leader_hint
+        assert login.leader_hint == bid.leader_hint == register.leader_hint
 
 
 def test_a_write_on_the_leader_is_visible_on_every_node(leader_stub):
@@ -417,3 +458,100 @@ def test_replicas_at_the_same_index_report_the_same_digest():
         time.sleep(0.05)
     pytest.fail("the nodes never reached the same applied index")
 
+
+
+# ---- Accounts and mock payments ----
+
+
+def _new_name():
+    return f"pytest-{uuid.uuid4().hex[:10]}"
+
+
+def test_login_never_creates_an_account(leader_stub):
+    resp = leader_stub.Login(
+        auction_pb2.LoginRequest(username=_new_name(), password="pytest-pw-123"), timeout=APP_TIMEOUT_SECONDS
+    )
+    assert not resp.success and not resp.session_token
+
+
+def test_a_username_can_be_registered_only_once(leader_stub):
+    name = _new_name()
+    first = leader_stub.Register(auction_pb2.RegisterRequest(username=name, password="pytest-pw-123"),
+                                 timeout=APP_TIMEOUT_SECONDS)
+    again = leader_stub.Register(auction_pb2.RegisterRequest(username=name, password="other-pw-456"),
+                                 timeout=APP_TIMEOUT_SECONDS)
+    assert first.success and not again.success
+    assert again.error_message == "Username already taken"
+
+
+def test_a_new_wallet_holds_the_welcome_credit_on_every_node():
+    token = _login(_new_name(), funds=0).session_token
+    for address in APP_SERVERS:
+        wallet = _payments(address).GetWallet(auction_pb2.WalletRequest(session_token=token),
+                                              timeout=APP_TIMEOUT_SECONDS)
+        assert wallet.success, address
+        assert wallet.balance == 5000.0 and wallet.available == 5000.0, address
+
+
+def test_a_bid_beyond_the_bidders_funds_is_refused(leader_stub):
+    seller = _login("pytest-seller").session_token
+    poor = _login(_new_name(), funds=0).session_token  # only the Rs 5,000 welcome credit
+    auction_id = _create(leader_stub, seller, "pytest funds-check auction", 60)
+    refused = leader_stub.PlaceBid(
+        auction_pb2.PlaceBidRequest(session_token=poor, auction_id=auction_id, amount=4_900.0),  # + 5% = 5,145
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert not refused.accepted and refused.error_message.startswith("Insufficient funds")
+    accepted = leader_stub.PlaceBid(
+        auction_pb2.PlaceBidRequest(session_token=poor, auction_id=auction_id, amount=4_700.0),  # + 5% = 4,935
+        timeout=APP_TIMEOUT_SECONDS,
+    )
+    assert accepted.accepted, accepted.error_message
+
+
+# ---- The assignment's generic post/get, and the Raft log view ----
+
+
+def test_get_returns_id_and_data_pairs(app_stub):
+    resp = app_stub.Get(auction_pb2.GetRequest(type="auctions", params={"status": "ACTIVE"}),
+                        timeout=APP_TIMEOUT_SECONDS)
+    assert resp.status == "OK"
+    for item in resp.items:
+        assert item.id and json.loads(item.data)["auction_id"] == item.id
+
+
+def test_post_places_a_bid_through_the_same_rules(leader_stub):
+    seller = _login("pytest-seller").session_token
+    bidder = _login("pytest-bidder-low").session_token
+    auction_id = _create(leader_stub, seller, "pytest post/get auction", 60)
+    ok = leader_stub.Post(auction_pb2.PostRequest(
+        token=bidder, type="bid", data=json.dumps({"auction_id": auction_id, "amount": 300})),
+        timeout=APP_TIMEOUT_SECONDS)
+    low = leader_stub.Post(auction_pb2.PostRequest(
+        token=bidder, type="bid", data=json.dumps({"auction_id": auction_id, "amount": 100})),
+        timeout=APP_TIMEOUT_SECONDS)
+    unknown = leader_stub.Post(auction_pb2.PostRequest(token=bidder, type="teleport", data="{}"),
+                               timeout=APP_TIMEOUT_SECONDS)
+    assert ok.status == "OK", ok.message
+    assert low.status == "REJECTED" and "greater than" in low.message
+    assert unknown.status == "INVALID"
+    wallet = leader_stub.Get(auction_pb2.GetRequest(token=bidder, type="wallet"), timeout=APP_TIMEOUT_SECONDS)
+    assert wallet.status == "OK" and json.loads(wallet.items[0].data)["committed"] > 0
+
+
+def test_post_to_a_follower_points_at_the_leader():
+    leader = _leader_address()
+    follower = next(a for a in APP_SERVERS if a != leader)
+    with grpc.insecure_channel(follower) as channel:
+        resp = auction_pb2_grpc.AuctionServiceStub(channel).Post(
+            auction_pb2.PostRequest(token="x", type="deposit", data='{"amount": 10}'), timeout=APP_TIMEOUT_SECONDS
+        )
+    assert resp.status == "NOT_LEADER" and resp.leader_hint
+
+
+def test_every_node_reports_the_tail_of_its_log():
+    for status in _statuses().values():
+        entries = list(status.recent_entries)
+        assert entries, status.node_id
+        assert entries[-1].index == status.last_log_index
+        assert all(e.op and e.label for e in entries)

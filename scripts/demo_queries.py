@@ -22,6 +22,7 @@ sys.path.insert(0, "generated")
 import auction_pb2
 import auction_pb2_grpc
 from cluster import DEFAULT_SERVERS, find_leader
+from accounts import sign_in
 from narrate import aside, heading
 
 LLM_TIMEOUT_SECONDS = 120  # model runs on CPU; app server allows up to 60s per call
@@ -35,8 +36,8 @@ def show_answer(label: str, text: str) -> None:
         print(f"     {line}")
 
 
-def login(stub, username: str, password: str) -> str:
-    resp = stub.Login(auction_pb2.LoginRequest(username=username, password=password), timeout=10)
+def login(channel, username: str, password: str) -> str:
+    resp = sign_in(channel, username, password)  # registers the persona the first time
     if not resp.success:
         raise SystemExit(f"login failed for {username}: {resp.error_message}")
     return resp.session_token
@@ -51,7 +52,7 @@ def main() -> int:
 
     with grpc.insecure_channel(args.server) as channel:
         stub = auction_pb2_grpc.AuctionServiceStub(channel)
-        student = login(stub, "parm", "parm123")
+        student = login(channel, "parm", "parm123")
 
         heading("1. Browse: active auctions")
         active = stub.ListAuctions(
@@ -88,7 +89,7 @@ def main() -> int:
         show_answer("plain-text fallback" if r.from_fallback else "LLM", r.answer if r.success else r.error_message)
 
         heading("4. List an item with NO description - the LLM writes one")
-        seller = login(stub, "tanmay", "tanmay123")
+        seller = login(channel, "tanmay", "tanmay123")
         created = stub.CreateAuction(
             auction_pb2.CreateAuctionRequest(
                 session_token=seller, title="Study lamp with adjustable arm", description="",
@@ -110,7 +111,7 @@ def main() -> int:
             ("nisargh", "nisargh123", 155.0),
             ("nahush", "nahush123", 100.0),  # too low - must be rejected
         ]:
-            token = login(stub, username, password)
+            token = login(channel, username, password)
             resp = stub.PlaceBid(
                 auction_pb2.PlaceBidRequest(session_token=token, auction_id=auction_id, amount=amount), timeout=10
             )
@@ -126,7 +127,7 @@ def main() -> int:
             aside("snipe")
 
         heading("5b. Nahush's phone loses signal and retries the same bid")
-        token = login(stub, "nahush", "nahush123")
+        token = login(channel, "nahush", "nahush123")
         request_id = uuid.uuid4().hex  # one id for the bid, reused on the retry
         for attempt in ("sent", "retried"):
             resp = stub.PlaceBid(

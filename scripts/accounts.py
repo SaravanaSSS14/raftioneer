@@ -1,6 +1,9 @@
 """Signing in, for the scripts: register the account if it is new, log in,
-and make sure its wallet holds at least `funds` (topping it up with a mock
-deposit if not) - so a test can bid far above the welcome credit.
+and make sure its wallet has at least `funds` *available* (topping it up
+with a mock deposit if not) - so a test can bid far above the welcome credit.
+Available, not balance: a bid is checked against the balance minus what the
+account is already the highest bidder for on open auctions, so a test account
+still leading an earlier run's auction would otherwise be short.
 
 Run against the leader: Register, Login and Deposit are writes.
 """
@@ -25,9 +28,9 @@ def sign_in(channel, username: str, password: str, funds: float = 0.0,
     if login.success and funds > 0:
         payments = auction_pb2_grpc.PaymentServiceStub(channel)
         wallet = payments.GetWallet(auction_pb2.WalletRequest(session_token=login.session_token), timeout=timeout)
-        if wallet.success and wallet.balance < funds:
+        if wallet.success and wallet.available < funds:
             payments.Deposit(auction_pb2.DepositRequest(
-                session_token=login.session_token, amount=round(funds - wallet.balance, 2)), timeout=timeout)
+                session_token=login.session_token, amount=round(funds - wallet.available, 2)), timeout=timeout)
     return login
 
 
@@ -44,7 +47,7 @@ async def sign_in_async(channel, username: str, password: str, funds: float = 0.
     if login.success and funds > 0:
         payments = auction_pb2_grpc.PaymentServiceStub(channel)
         wallet = await payments.GetWallet(auction_pb2.WalletRequest(session_token=login.session_token), timeout=timeout)
-        if wallet.success and wallet.balance < funds:
+        if wallet.success and wallet.available < funds:
             await payments.Deposit(auction_pb2.DepositRequest(
-                session_token=login.session_token, amount=round(funds - wallet.balance, 2)), timeout=timeout)
+                session_token=login.session_token, amount=round(funds - wallet.available, 2)), timeout=timeout)
     return login

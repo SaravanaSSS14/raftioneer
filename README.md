@@ -160,8 +160,8 @@ run the test suites. Open `/?tab=cluster` in a second window to watch the cluste
 | Tab | What it shows |
 | --- | --- |
 | **Auction floor** | Live auctions with countdowns. Register, sign in, bid (the dialog refreshes if you are outbid), sell an item (leave the description blank and the LLM writes it), and ask Tapri, the assistant, which cites the handbook sections it used. Also your wallet, closed auctions with their recaps, and *Confirm receipt* to release escrow |
-| **Raft cluster** | A live diagram (leader, followers, heartbeats); each node's term, log, commit and applied index; its newest log entries, coloured by term (dashed = not yet committed); a check that the replicas are identical; *Kill*, *Freeze* and *Restart* buttons; a timed *Kill the leader*; a switch for the simulated bidders; and a timeline of what happened |
-| **Proof** | The test suites and check scripts, run live with progress and a pass/fail result: unit and Raft tests, randomized churn, the consistency check, 400 simultaneous bids, leader failover, chaos and the contract tests |
+| **Raft cluster** | A live diagram (leader, followers, heartbeats); each node's term, log, commit and applied index; its newest log entries, coloured by term (dashed = not yet committed); a check that the replicas are identical; *Kill*, *Freeze* and *Restart* buttons; a timed *Kill the leader*; a switch for the simulated bidders; a timeline of what happened; and a legend explaining every colour and log label |
+| **Proof** | The test suites and check scripts, run live with progress and a pass/fail result: a health check, unit and Raft tests, randomized churn, the consistency check, the guided walkthrough, 400 simultaneous bids, leader failover, chaos and the contract tests |
 
 The same story is available without a browser: `python scripts/demo.py` runs six narrated
 acts in the terminal, and `python scripts/cluster.py --watch` shows roles and terms live.

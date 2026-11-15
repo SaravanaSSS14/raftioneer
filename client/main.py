@@ -121,6 +121,21 @@ async def session_for(leader: str, username: str, password: str) -> str | None:
     return resp.session_token
 
 
+_out_of_reach_reported: set[str] = set()
+
+
+def report_out_of_reach(auctions) -> None:
+    """Say once, per auction, when no persona can afford it - otherwise a
+    listing with a high reserve just sits there with no visible reason."""
+    top_budget = max(p[4] for p in BIDDER_PERSONAS)
+    for a in auctions:
+        floor = max(a.current_highest_bid, a.reserve_price)
+        if floor + 1 > top_budget and a.auction_id not in _out_of_reach_reported:
+            _out_of_reach_reported.add(a.auction_id)
+            log.info("no persona will bid on %r (auction=%s): it needs over Rs %.0f, the largest budget is Rs %.0f",
+                     a.item.title, a.auction_id, floor, top_budget)
+
+
 async def run_bidder_cycle(persona: tuple) -> None:
     """One persona's turn: Login (leader) -> ListAuctions (any node) -> PlaceBid (leader)."""
     global _leader
@@ -149,11 +164,15 @@ async def run_bidder_cycle(persona: tuple) -> None:
             a for a in list_resp.auctions
             if max(a.current_highest_bid, a.reserve_price) + min_raise <= budget
         ]
+        report_out_of_reach(list_resp.auctions)
         if not affordable:
             log.info("%s: nothing %s can afford right now", reader, username)
             return
 
-        auction = random.choice(affordable)
+        # A new listing nobody has bid on yet gets noticed first (most of the
+        # time), so an item listed live in a demo draws a bid within a cycle.
+        fresh = [a for a in affordable if a.current_highest_bid == 0]
+        auction = random.choice(fresh if fresh and random.random() < 0.7 else affordable)
         floor = max(auction.current_highest_bid, auction.reserve_price)
         bid_amount = round(min(floor + random.uniform(min_raise, max_raise), budget), 2)
 

@@ -140,6 +140,7 @@ class ClusterView:
         self.events_seen = -1
         self.docker: dict[str, str] = {}
         self.diagram_key = None
+        self.switching = False  # a bidders-switch flip is in progress
         self._build()
         ui.timer(0.5, self.tick)
         ui.timer(2.0, self.poll_docker)
@@ -176,19 +177,69 @@ class ClusterView:
                 with ui.card().classes("rt-card w-full p-4 gap-2"):
                     ui.label("What just happened").classes("font-semibold")
                     self.events = ui.column().classes("w-full gap-1")
-                with ui.card().classes("rt-card w-full p-4 gap-2"):
-                    ui.label("Reading the log").classes("font-semibold")
-                    with ui.row().classes("items-center gap-2 no-wrap"):
-                        ui.element("div").classes("rt-cell").style(f"background:{theme.TERM_COLOURS[1]}") \
-                            .props("aria-hidden=true")
-                        ui.label("committed: stored on a majority, applied, permanent").classes("text-sm")
-                    with ui.row().classes("items-center gap-2 no-wrap"):
-                        ui.element("div").classes("rt-cell rt-pending").style(f"color:{theme.TERM_COLOURS[1]}")
-                        ui.label("in the log, not yet committed").classes("text-sm")
-                    ui.label("Colour = the term the entry was written in, so a new leader's entries look "
-                             "different. BID, NEW (listing), REG, IN/OUT, DEP (deposit), CLOSE, RECAP, "
-                             "PAID (escrow released), NO-OP (a new leader's first entry).") \
-                        .classes("text-sm rt-muted")
+                self._legend()
+
+    @staticmethod
+    def _legend() -> None:
+        """What every colour and label on this tab means."""
+        def swatch(colour: str, text: str, dashed: bool = False) -> None:
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                border = f"border:2px dashed {colour}; background:transparent" if dashed else f"background:{colour}"
+                ui.element("div").style(f"width:14px;height:14px;border-radius:50%;flex:none;{border}")
+                ui.label(text).classes("text-sm")
+
+        with ui.card().classes("rt-card w-full p-4 gap-2"):
+            ui.label("Reading this page").classes("font-semibold")
+
+            ui.label("Nodes (circles and badges)").classes("text-xs font-semibold rt-muted mt-1")
+            swatch(theme.LEADER, "leader ♛ - the only node that accepts writes; its card has an amber ring")
+            swatch(theme.FOLLOWER, "follower - copies the leader's log, serves reads")
+            swatch(theme.CANDIDATE, "candidate ? - its election timer ran out; asking for votes", dashed=True)
+            swatch(theme.FROZEN, "frozen ❄ - docker pause: alive but gets no CPU (a zombie)")
+            swatch(theme.DOWN, "down ✕ - container killed or not answering")
+            ui.label("Amber dots moving from the leader to a follower are its heartbeats "
+                     "(AppendEntries, every 0.2 s). A follower that stops hearing them starts an election.") \
+                .classes("text-sm rt-muted")
+
+            ui.label("Node card numbers").classes("text-xs font-semibold rt-muted mt-2")
+            ui.label("term - the election period the node believes it is in (goes up with each election). "
+                     "log - index of its newest entry. commit - newest entry known to be on a majority. "
+                     "applied - newest entry run on its auction database. log > commit means entries are "
+                     "waiting for a majority; commit > applied means it is catching up.") \
+                .classes("text-sm")
+
+            ui.label("Log entries (squares, newest on the right)").classes("text-xs font-semibold rt-muted mt-2")
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.element("div").classes("rt-cell").style(f"background:{theme.TERM_COLOURS[1]}") \
+                    .props("aria-hidden=true")
+                ui.label("filled - committed: on a majority of nodes, applied, can never be undone").classes("text-sm")
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.element("div").classes("rt-cell rt-pending").style(f"color:{theme.TERM_COLOURS[1]}")
+                ui.label("dashed - written to this node's log, not committed yet (a deposed leader's "
+                         "uncommitted entries can be overwritten)").classes("text-sm")
+            ui.label("The colour is the term the entry was created in, so a new leader's entries switch colour. "
+                     f"There are {len(theme.TERM_COLOURS)} colours, repeating every "
+                     f"{len(theme.TERM_COLOURS)} terms:").classes("text-sm")
+            with ui.row().classes("gap-1 items-center"):
+                for term, colour in enumerate(theme.TERM_COLOURS):
+                    ui.label(str(term)).classes("text-[10px] text-white font-bold text-center rounded") \
+                        .style(f"background:{colour};width:22px;line-height:18px")
+                ui.label("= term mod 8").classes("text-xs rt-muted")
+            ui.label("Small #number = the entry's log index. Hover over a square for its term and details.") \
+                .classes("text-sm rt-muted")
+
+            ui.label("Entry labels (the command inside)").classes("text-xs font-semibold rt-muted mt-2")
+            with ui.grid().classes("w-full gap-x-3 gap-y-0 text-sm").style("grid-template-columns: auto 1fr"):
+                for short, meaning in [
+                    ("BID", "a bid (accepted or refused - both are recorded)"),
+                    ("NEW", "an auction listed"), ("REG", "an account registered"),
+                    ("IN / OUT", "log in / log out"), ("DEP", "a mock wallet deposit"),
+                    ("CLOSE", "the leader's clock closing expired auctions; escrow held"),
+                    ("RECAP", "the LLM's post-auction summary"), ("PAID", "buyer confirmed receipt; escrow released"),
+                    ("NO-OP", "a new leader's first entry, which commits everything before it"),
+                ]:
+                    ui.label(short).classes("rt-mono font-semibold")
+                    ui.label(meaning).classes("rt-muted")
 
     # ------------------------------------------------------------ updates
 
@@ -196,6 +247,10 @@ class ClusterView:
         states = await ops.container_states()
         if states:
             self.docker = states
+            # While a switch flip is still being carried out, the container is
+            # mid-change: syncing now would flip the switch back for a moment.
+            if self.switching:
+                return
             running = states.get("client") == "running"
             if running != self.bidders.value:
                 self.bidders.set_value(running)  # mirror what another tab (or the terminal) did
@@ -203,9 +258,15 @@ class ClusterView:
     async def _toggle_bidders(self, event) -> None:
         # Only act when the switch disagrees with the container: a switch that
         # is merely being synced to the real state (above) must not act again.
-        if event.value == (self.docker.get("client") == "running"):
+        if self.switching or event.value == (self.docker.get("client") == "running"):
             return
-        code, out = await ops.set_simulated_bidders(event.value)
+        self.switching = True
+        self.bidders.disable()
+        try:
+            code, out = await ops.set_simulated_bidders(event.value, self.docker.get("client", ""))
+        finally:
+            self.switching = False
+            self.bidders.enable()
         await self.poll_docker()
         if code == 0:
             snapshots.event("info", f"simulated bidders {'started' if event.value else 'stopped'} from the UI")

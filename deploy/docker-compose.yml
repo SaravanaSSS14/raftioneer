@@ -111,6 +111,7 @@ services:
       context: ..
       dockerfile: client/Dockerfile
     image: raftioneer-client
+    init: true  # stops at once (the dashboard's bidders switch), not after a 10 s timeout
     environment:
       - NODE_ID=client
       - APP_SERVERS=app_server_1:50051,app_server_2:50051,app_server_3:50051

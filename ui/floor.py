@@ -12,6 +12,7 @@ from backend import Session, bid_history, get_auction, snapshots
 from theme import money, name
 
 PREMIUM_PERCENT = 5.0  # the cluster's default BUYERS_PREMIUM_PERCENT
+PERSONA_TOP_BUDGET = 4000.0  # nisargh's budget, the largest in client/main.py
 ACTIVE, CLOSED = 2, 3  # auction_pb2.AuctionStatus values
 
 SUGGESTED_QUESTIONS = [
@@ -543,6 +544,11 @@ class Floor:
                 reserve = ui.number("Reserve (Rs)", value=0, min=0, format="%.0f").props("outlined").classes("grow")
                 duration = ui.select({60: "1 minute", 120: "2 minutes", 300: "5 minutes", 600: "10 minutes",
                                       3600: "1 hour"}, value=120, label="Runs for").props("outlined").classes("grow")
+            # The client node's personas never bid past their budgets (client/main.py).
+            ui.label(f"The simulated bidders spend at most {money(PERSONA_TOP_BUDGET)} - above that, only "
+                     "people bidding by hand will bid.") \
+                .classes("text-xs text-warning") \
+                .bind_visibility_from(reserve, "value", backward=lambda v: (v or 0) >= PERSONA_TOP_BUDGET)
 
             async def create() -> None:
                 if not title.value.strip():

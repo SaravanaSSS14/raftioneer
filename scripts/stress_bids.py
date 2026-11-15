@@ -80,6 +80,9 @@ async def run(server: str, replicas: list[str], bidders: int, bids: int) -> int:
     print(f"accepted {len(accepted)} of {len(results)} bids")
     for reason, count in reasons.most_common():
         print(f"  rejected x{count}: {reason}")
+    if not accepted:
+        narrate.verdict(False, "no bid was accepted, so there is nothing to compare - see the rejections above")
+        return 1
     print(f"highest accepted bid: {max(accepted):.2f}")
     print(f"auction's final highest bid on the leader: {final:.2f}")
     ok = abs(final - max(accepted)) < 1e-9

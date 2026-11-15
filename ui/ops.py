@@ -65,8 +65,11 @@ async def unfreeze(node_id: str) -> tuple[int, str]:
     return await run(*COMPOSE, "unpause", service_of(node_id))
 
 
-async def set_simulated_bidders(on: bool) -> tuple[int, str]:
-    """Start or stop the client node (Node 5: the bidder personas)."""
+async def set_simulated_bidders(on: bool, current_state: str = "") -> tuple[int, str]:
+    """Start or stop the client node (Node 5: the bidder personas). A client
+    left paused by an interrupted chaos run is unpaused, not started."""
+    if on and current_state == "paused":
+        return await run(*COMPOSE, "unpause", "client")
     return await run(*COMPOSE, "start" if on else "stop", "client")
 
 
@@ -101,6 +104,10 @@ class Suite:
 
 
 SUITES = [
+    Suite("health", "Health check",
+          "Every RPC on all three app servers, exactly one leader that all nodes agree on, and the LLM node "
+          "answering. Run this first.",
+          [PY, "scripts/smoke_test.py"], "monitor_heart"),
     Suite("unit", "Raft and unit tests",
           "Raft in-process with crashes and partitions, the state machine replayed byte for byte, "
           "wallet and escrow rules, the assistant, handbook retrieval.",
@@ -112,6 +119,10 @@ SUITES = [
     Suite("consistency", "Replicas are identical",
           "Every node's applied digest at the same index, and every auction, bid and outcome, compared.",
           [PY, "scripts/consistency_check.py"], "fact_check"),
+    Suite("tour", "Guided walkthrough",
+          "The terminal demo end to end: browse, ask Tapri (with the fine print), an LLM-written listing, "
+          "a bid refused as too low, anti-sniping, a retried bid counted once, the close and recap.",
+          [PY, "scripts/demo_queries.py"], "tour"),
     Suite("stress", "400 simultaneous bids",
           "400 bids at once on one auction: the log puts them in one order and every replica agrees "
           "on the winner.",

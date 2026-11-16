@@ -16,9 +16,9 @@ Project option F: Distributed Online Auction System*
 | **Consensus** | Raft with leader election, log replication, persistence, failure detection and pre-vote |
 | **Auctions** | Accounts, listings, concurrency-safe bidding, an automatic auction clock with anti-sniping, winner determination |
 | **Payments (mock)** | Wallets, a funds check on every bid, escrow held at close and released on hand-over |
-| **Assistant** | Bidder FAQ, item descriptions and auction recaps, grounded in an auction handbook and the live auction data |
+| **Assistant** | Tapri: bidder FAQ, item descriptions and auction recaps, grounded in an auction handbook and the live auction data, including closed lots and their results; answers about results are checked against the record |
 | **Fault tolerance** | Leader crash, follower crash, frozen leader, network partition and loss of majority, all tested |
-| **Verification** | 152 automated tests, a chaos run with a consistency checker, a stress test, CI on every push |
+| **Verification** | 165 automated tests, a chaos run with a consistency checker, a stress test, CI on every push |
 
 ---
 
@@ -131,7 +131,7 @@ moves the winner's payment into escrow.
 | Auction timer and winner determination | The leader's clock closes expired auctions through the log; the highest bid wins. **Anti-sniping:** a bid in the last 10 s extends the auction |
 | Payment and escrow (mock) | `PaymentService`: wallets with a Rs 5,000 welcome credit, deposits, a funds check at bid time, escrow held at close and released to the seller when the winner confirms receipt |
 | Authentication and sessions | `Register` and `Login`; salted PBKDF2 password hashes; one-hour sessions |
-| LLM: bidding assistant (FAQ) | `AskAssistant`: the LLM node retrieves the relevant sections of an [auction handbook](llm_server/knowledge/auction_handbook.md) and is given the auction and the asker's wallet |
+| LLM: bidding assistant (FAQ) | `AskAssistant`: the LLM node retrieves the relevant sections of an [auction handbook](llm_server/knowledge/auction_handbook.md) and is given the auction (its bids, result and escrow state) or a summary of the floor, and the asker's wallet |
 | LLM: item descriptions | A blank description on a new listing is written by the LLM node |
 | LLM: auction results and pricing trends | A recap of every closed auction, compared with the average sale price |
 | Domain-specific, context-aware LLM on a separate node | A custom model, `raftioneer-tapri`, is built at startup from `qwen2.5:1.5b` with the house persona and rules baked in. Answers are grounded in the handbook and the live auction data. The model is not fine-tuned |
@@ -154,14 +154,15 @@ moves the winner's payment into escrow.
 ## 4. The demo dashboard
 
 `python ui/app.py`, then open **http://localhost:8080**. It is one more client node: it talks to
-the cluster over gRPC like any other client. It can also kill, freeze and restart containers, and
-run the test suites. Open `/?tab=cluster` in a second window to watch the cluster while you bid.
+the cluster over gRPC like any other client. It can also stop, freeze and restart containers, and
+run the checks. The logo is the cluster itself: three dots, the amber one is the current leader.
 
 | Tab | What it shows |
 | --- | --- |
-| **Auction floor** | Live auctions with countdowns. Register, sign in, bid (the dialog refreshes if you are outbid), sell an item (leave the description blank and the LLM writes it), and ask Tapri, the assistant, which cites the handbook sections it used. Also your wallet, closed auctions with their recaps, and *Confirm receipt* to release escrow |
-| **Raft cluster** | A live diagram (leader, followers, heartbeats); each node's term, log, commit and applied index; its newest log entries, coloured by term (dashed = not yet committed); a check that the replicas are identical; *Kill*, *Freeze* and *Restart* buttons; a timed *Kill the leader*; a switch for the simulated bidders; a timeline of what happened; and a legend explaining every colour and log label |
-| **Proof** | The test suites and check scripts, run live with progress and a pass/fail result: a health check, unit and Raft tests, randomized churn, the consistency check, the guided walkthrough, 400 simultaneous bids, leader failover, chaos and the contract tests |
+| **Floor** | Each auction as a numbered lot with its countdown. Register, sign in, bid (the dialog shows the minimum bid, the premium and the bid history, and refreshes if you are outbid), sell an item (leave the description blank and the LLM writes it). Also your wallet, your wins, closed lots with their recaps, and *Confirm receipt* to release escrow |
+| **Cluster** | A status strip (leader, term, nodes up, commit index, last election) and all five nodes: the three app servers with heartbeats from the leader, the client node whose bids flow to whoever leads, and the LLM node outside the cluster. Each app server's term, log, commit and applied index and its newest log entries (coloured by term, dashed = not yet committed); a check that the replicas are identical; *Kill*, *Freeze* and *Restart*; a timed *Kill the leader*; switches for the simulated bidders and the LLM node; a timeline; and a legend |
+| **Evidence** | One row per claim with the script that checks it, run exactly as shown: live checks (health, identical replicas, 400 simultaneous bids, leader failover, chaos) and full suites (the offline tests, randomized churn, the contract tests, the walkthrough) |
+| **Tapri** (every tab) | The assistant in a side panel, asked in general or about any open or closed lot, with the handbook sections it used and the fine print from the record under each answer |
 
 The same story is available without a browser: `python scripts/demo.py` runs six narrated
 acts in the terminal, and `python scripts/cluster.py --watch` shows roles and terms live.
@@ -254,7 +255,7 @@ A bid or deposit may carry a `request_id`. A retry with the same id gets the ori
 ## 8. Testing and verification
 
 ```bash
-# No Docker needed: Raft, state machine, payments, assistant, retrieval (104 tests, ~15 s)
+# No Docker needed: Raft, state machine, payments, assistant, retrieval (117 tests, ~20 s)
 pytest tests/test_raft.py tests/test_state_machine.py tests/test_assistant.py \
        tests/test_llm_service.py tests/test_pricing_trend_db.py tests/test_retrieval.py
 python scripts/raft_churn.py            # randomized crashes and partitions, 30 seeds
@@ -272,7 +273,7 @@ python scripts/chaos.py                 # random faults, then every safety check
 | --- | --- |
 | [`test_raft.py`](tests/test_raft.py) (25) | An in-process cluster that can crash nodes and cut links: one leader per term, ordered replication, leader crash, partitioned leader, full restart from disk, log repair, pre-vote, and each RPC rule on its own |
 | [`test_state_machine.py`](tests/test_state_machine.py) (27) | Replaying the same log gives a byte-identical database; bid rules; funds, escrow and deposits; anti-sniping; exactly-once |
-| [`test_assistant.py`](tests/test_assistant.py), [`test_llm_service.py`](tests/test_llm_service.py), [`test_retrieval.py`](tests/test_retrieval.py), [`test_pricing_trend_db.py`](tests/test_pricing_trend_db.py) (52) | Context and fallbacks, wallet facts, recap fact check, handbook retrieval, request id round trip |
+| [`test_assistant.py`](tests/test_assistant.py), [`test_llm_service.py`](tests/test_llm_service.py), [`test_retrieval.py`](tests/test_retrieval.py), [`test_pricing_trend_db.py`](tests/test_pricing_trend_db.py) (65) | Context and fallbacks, wallet facts, closed lots and the floor, the recap and result fact checks, handbook retrieval, request id round trip |
 | [`test_contract.py`](tests/test_contract.py) (48) | The live cluster: one leader, redirects, replication to every node, accounts, the funds check, escrow release, post/get, anti-sniping, exactly-once, digests |
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the lint, every offline test and
@@ -338,7 +339,9 @@ All settings are environment variables, set per node in
 ## 12. Known limitations
 
 - The log is never compacted (no snapshots), so a restarted node replays it in full.
-- Reads on a follower can trail the leader by about one round trip; reads are not linearizable.
+- Reads on a follower can trail the leader by about one round trip; reads are not linearizable. A
+  follower that has just restarted answers from an empty state until the leader's first heartbeat
+  tells it what is committed (under a second).
 - Membership is fixed at three app servers.
 - No check-quorum: a leader cut off from its majority keeps leading until it hears a later term
   (its writes time out rather than commit).
@@ -364,7 +367,7 @@ app_server/        an auction node
   store/           SQLite access and password hashing
 llm_server/        the LLM node: gRPC service, retrieval, prompts, Ollama client
   knowledge/       the auction handbook used for retrieval
-ui/                the demo dashboard (NiceGUI): floor, cluster, proof
+ui/                the demo dashboard (NiceGUI): floor, cluster, evidence, Tapri
 client/            simulated bidders (Node 5)
 deploy/            docker-compose.yml for the whole system
 scripts/           demo, cluster status, seeding, failover, chaos, consistency, stress, benchmark, churn

@@ -15,14 +15,6 @@ PREMIUM_PERCENT = 5.0  # the cluster's default BUYERS_PREMIUM_PERCENT
 PERSONA_TOP_BUDGET = 4000.0  # nisargh's budget, the largest in client/main.py
 ACTIVE, CLOSED = 2, 3  # auction_pb2.AuctionStatus values
 
-SUGGESTED_QUESTIONS = [
-    "How much can I bid with my wallet?",
-    "Why did the end time move?",
-    "How does escrow work?",
-    "What if the server crashes during my bid?",
-]
-
-
 def next_valid(auction) -> float:
     """A sensible suggested bid: about 5% over the highest, or the reserve."""
     if auction.current_highest_bid > 0:
@@ -45,22 +37,23 @@ class AuctionCard:
         self.floor, self.id = floor, auction.auction_id
         self.end_ms, self.bid = auction.end_time_ms, -1.0
         with floor.grid:
+            # A lot ticket: number and clock on top, the actions below a perforation.
             with ui.card().classes("rt-card p-4 gap-2") as self.card:
-                with ui.row().classes("w-full items-start no-wrap gap-2"):
-                    self.title = ui.label().classes("font-semibold text-[15px] leading-snug grow")
-                    self.clock = ui.chip(icon="schedule").props("dense square outline")
-                self.desc = ui.label().classes("text-sm rt-muted rt-clamp min-h-[2.5rem]")
-                with ui.row().classes("w-full items-end no-wrap"):
-                    with ui.column().classes("gap-0 grow"):
-                        self.price = ui.label().classes("rt-price")
-                        self.who = ui.label().classes("text-xs rt-muted")
-                    self.extended = ui.badge(color="orange-7").props("rounded")
+                with ui.row().classes("w-full items-center no-wrap gap-2"):
+                    ui.label(f"lot {auction.auction_id[:4]}").classes("rt-label grow")
+                    self.extended = ui.label().classes("rt-label").style(f"color:{theme.CANDIDATE}")
                     self.extended.tooltip("Anti-sniping: a late bid moved the end time")
-                with ui.row().classes("w-full gap-2 no-wrap"):
-                    ui.button("Bid", icon="gavel", on_click=lambda: floor.open_bid(self.id)) \
-                        .props("unelevated").classes("grow")
-                    ui.button(icon="support_agent", on_click=lambda: floor.open_ask(self.id)) \
-                        .props("flat round color=primary").tooltip("Ask Tapri about this item")
+                    self.clock = ui.label().classes("rt-mono text-sm font-bold")
+                self.title = ui.label().classes("font-semibold text-[15px] leading-snug")
+                self.desc = ui.label().classes("text-sm rt-muted rt-clamp min-h-[2.5rem]")
+                self.price = ui.label().classes("rt-price")
+                self.who = ui.label().classes("text-xs rt-muted -mt-2")
+                ui.element("div").classes("rt-tear mt-1")
+                with ui.row().classes("w-full gap-2 no-wrap items-center"):
+                    ui.button("Bid", on_click=lambda: floor.open_bid(self.id)) \
+                        .props("unelevated no-caps").classes("grow")
+                    ui.button("Ask Tapri", icon="local_cafe", on_click=lambda: floor.tapri.open(self.id)) \
+                        .props("flat no-caps dense").style(f"color:{theme.CHAI}")
         self.update(auction)
 
     def update(self, auction) -> None:
@@ -86,13 +79,13 @@ class AuctionCard:
     def tick(self) -> None:
         text, left = theme.countdown(self.end_ms)
         self.clock.set_text(text if left else "closing…")
-        colour = "red-7" if left < 15 else "orange-8" if left < 60 else "grey-8"
-        self.clock.props(f"color={colour}")
+        self.clock.style(f"color:{'#b91c1c' if left < 15 else theme.CANDIDATE if left < 60 else theme.INK}")
 
 
 class Floor:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, tapri) -> None:
         self.session = session
+        self.tapri = tapri  # the assistant panel, shared with the other tabs
         self.cards: dict[str, AuctionCard] = {}
         self.version_seen = -1
         self.show_tests = False
@@ -135,17 +128,17 @@ class Floor:
         with ui.row().classes("w-full items-start gap-6 no-wrap max-lg:flex-wrap"):
             with ui.column().classes("grow gap-4 min-w-0"):
                 with ui.row().classes("w-full items-center gap-3"):
-                    ui.label("Live auctions").classes("text-xl font-bold")
+                    ui.label("On the floor").classes("rt-title")
                     self.count = ui.badge("0", color="grey-4", text_color="grey-9").props("rounded")
                     ui.space()
                     ui.switch("test auctions", on_change=self._toggle_tests).props("dense color=grey-7") \
-                        .classes("text-sm rt-muted").tooltip("Show the auctions the test scripts create")
-                    ui.button("Sell an item", icon="add_circle", on_click=self.open_sell).props("unelevated")
+                        .classes("text-sm rt-muted").tooltip("Lots created by the check scripts")
+                    ui.button("Sell an item", on_click=self.open_sell).props("unelevated no-caps")
                 self.grid = ui.element("div").classes("grid gap-4 w-full") \
                     .style("grid-template-columns: repeat(auto-fill, minmax(280px, 1fr))")
-                self.empty = ui.label("No live auctions right now - list one with “Sell an item”.") \
+                self.empty = ui.label("No live lots.") \
                     .classes("rt-muted")
-                ui.label("Recently closed").classes("text-lg font-bold mt-4")
+                ui.label("Closed lots").classes("rt-title mt-4")
                 self.closed = ui.column().classes("w-full gap-3")
             self.side = ui.column().classes("w-[340px] shrink-0 gap-4 max-lg:w-full")
         self._build_side()
@@ -212,10 +205,10 @@ class Floor:
                 ui.label("No sale - no bid met the rules").classes("text-sm rt-muted")
             if result.summary_ready:
                 with ui.row().classes("items-start gap-2 no-wrap mt-1"):
-                    ui.icon("support_agent").classes("text-primary mt-[2px]")
-                    ui.label(result.summary).classes("text-sm italic text-slate-600")
+                    ui.icon("local_cafe").classes("mt-[2px]").style(f"color:{theme.CHAI}")
+                    ui.label(result.summary).classes("text-sm italic")
                     ui.badge("template" if result.summary_from_fallback else "LLM",
-                             color="grey-5" if result.summary_from_fallback else "indigo-4").props("outline")
+                             color="grey-7" if result.summary_from_fallback else "brown-6").props("outline")
             else:
                 with ui.row().classes("items-center gap-2"):
                     ui.spinner("dots", size="1.2em")
@@ -251,7 +244,7 @@ class Floor:
     def _sign_in_card(self) -> None:
         with ui.card().classes("rt-card w-full p-5 gap-3"):
             ui.label("Join the auction").classes("text-lg font-bold")
-            ui.label("Register once, then sign in. New wallets get Rs 5,000 of mock money.") \
+            ui.label("New accounts start with Rs 5,000 of mock money.") \
                 .classes("text-sm rt-muted")
             username = ui.input("Username").props("outlined dense").classes("w-full")
             password = ui.input("Password", password=True, password_toggle_button=True) \
@@ -299,7 +292,7 @@ class Floor:
 
                 ui.button(icon="logout", on_click=sign_out).props("flat round").tooltip("Sign out")
             ui.separator()
-            ui.label("Wallet balance").classes("text-xs rt-muted uppercase tracking-wide")
+            ui.label("Wallet balance").classes("rt-label")
             self.wallet_labels["balance"] = ui.label("…").classes("rt-price")
             with ui.grid(columns=3).classes("w-full gap-2"):
                 for key, label, tip in [
@@ -315,7 +308,7 @@ class Floor:
 
     def _about_card(self) -> None:
         with ui.card().classes("rt-card w-full p-4 gap-1"):
-            ui.label("How it works").classes("font-semibold")
+            ui.label("House rules").classes("rt-label")
             for icon, text in [
                 ("hub", "Every bid is a Raft log entry, committed on a majority of three servers."),
                 ("payments", "A bid needs its price + 5% premium in available funds."),
@@ -324,7 +317,7 @@ class Floor:
             ]:
                 with ui.row().classes("items-start gap-2 no-wrap"):
                     ui.icon(icon).classes("text-primary mt-[2px]")
-                    ui.label(text).classes("text-sm text-slate-600")
+                    ui.label(text).classes("text-sm")
 
     def _render_wins(self) -> None:
         if not self.session.signed_in or not hasattr(self, "wins"):
@@ -378,7 +371,7 @@ class Floor:
 
     def _need_session(self) -> bool:
         if not self.session.signed_in:
-            ui.notify("Sign in first (panel on the right)", type="warning")
+            ui.notify("Sign in to do that", type="warning")
             return False
         return True
 
@@ -431,7 +424,7 @@ class Floor:
                 history_box.clear()
                 with history_box:
                     if not history:
-                        ui.label("No bids yet - be the first.").classes("text-sm rt-muted")
+                        ui.label("No bids yet.").classes("text-sm rt-muted")
                     for bid in reversed(history[-10:]):
                         mine = bid.bidder_id == self.session.user_id
                         with ui.row().classes("w-full no-wrap text-sm"):
@@ -453,7 +446,7 @@ class Floor:
                 elif reply.accepted:
                     note = " (a retry - answered from the request table)" if reply.replayed else ""
                     ui.notify(f"Your bid of {money(value)} is committed on a majority{note}",
-                              type="positive", icon="gavel")
+                              type="positive")
                     dialog.close()
                 else:
                     ui.notify(reply.error_message, type="negative", multi_line=True)
@@ -463,7 +456,7 @@ class Floor:
 
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("Cancel", on_click=dialog.close).props("flat")
-                button = ui.button("Place bid", icon="gavel", on_click=place).props("unelevated")
+                button = ui.button("Place bid", on_click=place).props("unelevated no-caps")
             amount.on("keydown.enter", place)
 
             ui.separator()
@@ -472,81 +465,20 @@ class Floor:
         await refresh(suggest=True)
         dialog.open()
 
-    async def open_ask(self, auction_id: str = "") -> None:
-        if not self._need_session():
-            return
-        auction = self._auction(auction_id) if auction_id else None
-        with ui.dialog() as dialog, ui.card().classes("w-[600px] max-w-full p-0 gap-0"):
-            with ui.row().classes("w-full items-center gap-3 p-4 bg-slate-50 no-wrap"):
-                with ui.avatar(color="amber-6", text_color="white"):
-                    ui.label("T")
-                with ui.column().classes("gap-0 grow"):
-                    ui.label("Tapri · the auction assistant").classes("font-semibold")
-                    ui.label(f"about: {auction.item.title}" if auction else "house rules, your wallet, anything")\
-                        .classes("text-xs rt-muted")
-                ui.button(icon="close", on_click=dialog.close).props("flat round dense")
-            with ui.scroll_area().classes("w-full h-[380px]") as scroller:
-                chat = ui.column().classes("w-full p-2 gap-3")
-            with ui.row().classes("w-full gap-2 px-4"):
-                for question in SUGGESTED_QUESTIONS:
-                    ui.chip(question, on_click=lambda q=question: send(q)).props("outline dense clickable")
-            with ui.row().classes("w-full items-center gap-2 p-4 no-wrap"):
-                box = ui.input(placeholder="Ask Tapri…").props("outlined dense").classes("grow")
-                ui.button(icon="send", on_click=lambda: send(box.value)).props("round unelevated")
-            box.on("keydown.enter", lambda: send(box.value))
-
-            async def send(question: str) -> None:
-                question = (question or "").strip()
-                if not question:
-                    return
-                box.set_value("")
-                with chat:
-                    with ui.row().classes("w-full justify-end"):
-                        ui.label(question).classes("rt-chat-q px-3 py-2 text-sm max-w-[80%]")
-                    with ui.row().classes("w-full") as thinking:
-                        with ui.row().classes("rt-chat-a px-3 py-2 items-center gap-2"):
-                            ui.spinner("dots", size="1.4em")
-                            ui.label("Tapri is thinking (a 1.5B model on CPU)…").classes("text-sm rt-muted")
-                scroller.scroll_to(percent=1.0)
-                try:
-                    reply = await self.session.ask(question, auction_id)
-                except Exception:
-                    reply = None
-                thinking.delete()
-                with chat, ui.row().classes("w-full"):
-                    with ui.column().classes("rt-chat-a px-3 py-2 gap-2 max-w-[90%] rt-pop"):
-                        if reply is None or not reply.success:
-                            ui.label(reply.error_message if reply else "Couldn't reach the cluster.") \
-                                .classes("text-sm text-negative")
-                            return
-                        answer, _, fine = reply.answer.partition("\n\nFine print")
-                        ui.label(answer).classes("text-sm whitespace-pre-line")
-                        if fine:
-                            ui.label("Fine print" + fine).classes("text-xs text-slate-500 border-l-2 pl-2")
-                        with ui.row().classes("gap-1 items-center"):
-                            ui.badge("offline fallback" if reply.from_fallback else "LLM · raftioneer-tapri",
-                                     color="grey-6" if reply.from_fallback else "indigo-5").props("outline")
-                            for source in reply.sources:
-                                ui.chip(source, icon="menu_book").props("dense outline color=teal-7") \
-                                    .classes("text-[11px]").tooltip("Handbook section the answer was grounded in")
-                scroller.scroll_to(percent=1.0)
-        dialog.open()
-
     def open_sell(self) -> None:
         if not self._need_session():
             return
         with ui.dialog() as dialog, ui.card().classes("w-[480px] p-6 gap-3"):
             ui.label("Sell an item").classes("text-lg font-bold")
             title = ui.input("Title", placeholder="e.g. Firefox cycle, 21 gears").props("outlined").classes("w-full")
-            description = ui.textarea("Description", placeholder="Leave blank - Tapri will write one") \
+            description = ui.textarea("Description", placeholder="Optional - Tapri writes one if blank") \
                 .props("outlined autogrow").classes("w-full")
             with ui.row().classes("w-full gap-3 no-wrap"):
                 reserve = ui.number("Reserve (Rs)", value=0, min=0, format="%.0f").props("outlined").classes("grow")
                 duration = ui.select({60: "1 minute", 120: "2 minutes", 300: "5 minutes", 600: "10 minutes",
                                       3600: "1 hour"}, value=120, label="Runs for").props("outlined").classes("grow")
             # The client node's personas never bid past their budgets (client/main.py).
-            ui.label(f"The simulated bidders spend at most {money(PERSONA_TOP_BUDGET)} - above that, only "
-                     "people bidding by hand will bid.") \
+            ui.label(f"Above {money(PERSONA_TOP_BUDGET)} the simulated bidders are out of budget.") \
                 .classes("text-xs text-warning") \
                 .bind_visibility_from(reserve, "value", backward=lambda v: (v or 0) >= PERSONA_TOP_BUDGET)
 
@@ -574,7 +506,7 @@ class Floor:
     def open_deposit(self) -> None:
         with ui.dialog() as dialog, ui.card().classes("w-[380px] p-6 gap-3"):
             ui.label("Add money (mock)").classes("text-lg font-bold")
-            ui.label("No real payment - the amount is added to your wallet through a Raft command.") \
+            ui.label("Mock money, added through a Raft command.") \
                 .classes("text-sm rt-muted")
             amount = ui.number("Amount (Rs)", value=5000, min=1, format="%.0f").props("outlined").classes("w-full")
             with ui.row().classes("gap-2"):

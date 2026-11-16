@@ -456,37 +456,71 @@ class AuctionServiceServicer(RaftWriter, auction_pb2_grpc.AuctionServiceServicer
             if not question:
                 return auction_pb2.AskAssistantResponse(success=False, error_message="Question is required")
 
-            auction, bid_count = None, 0
+            # Live facts beyond the one auction: its bid history and result, or -
+            # for a question about no auction in particular - the whole floor,
+            # open and closed. The LLM node holds no state; whatever it should
+            # know about lots and their history has to be handed to it here.
+            user_id, asker = session["user_id"], session["username"]
+            auction, bid_count, outcome, settlement = None, 0, "", None
+            auctions, settlements = [], {}
             if request.auction_id:
                 auction = database.get_auction(request.auction_id)
                 if not auction:
                     return auction_pb2.AskAssistantResponse(success=False, error_message="Auction not found")
-                bid_count = len(database.get_bids_for_auction(request.auction_id))
+                bids = database.get_bids_for_auction(request.auction_id)
+                bid_count = len(bids)
+                settlement = database.get_settlement(request.auction_id)
+                outcome = assistant.outcome_facts(auction, settlement)
+                extra = "\n".join(part for part in (
+                    assistant.bid_history_facts(bids), assistant.outcome_facts(auction, settlement, asker)) if part)
+            else:
+                auctions = database.get_all_auctions()
+                settlements = {a["auction_id"]: s for a in auctions if a["status"] != "ACTIVE"
+                               and (s := database.get_settlement(a["auction_id"])) is not None}
+                extra = assistant.floor_facts(auctions, settlements)
+            closed_lot = auction is not None and auction["status"] != "ACTIVE"
 
             now = now_ms()
             # Context-aware: the asker's own wallet, so "how much can I bid?"
-            # is answered for them, not in general.
-            user_id = session["user_id"]
-            wallet = assistant.wallet_facts(
-                session["username"], database.get_wallet_balance(user_id) or 0.0,
-                database.committed_funds(user_id, assistant.BUYERS_PREMIUM_PERCENT), database.in_escrow(user_id),
-            )
+            # is answered for them, not in general. Left out where it cannot
+            # matter (a closed lot, a question about results): a small model
+            # works whatever it is handed into the answer.
+            wallet = ""
+            if not closed_lot and (auction is not None or assistant.about_wallet(question)
+                                   or not assistant.about_results(question)):
+                wallet = assistant.wallet_facts(
+                    asker, database.get_wallet_balance(user_id) or 0.0,
+                    database.committed_funds(user_id, assistant.BUYERS_PREMIUM_PERCENT), database.in_escrow(user_id),
+                )
 
             if self.llm is not None:
                 request_id = uuid.uuid4().hex[:12]
                 try:
                     reply = await self.llm.get_answer(
-                        question, assistant.build_context(auction, bid_count, now, wallet), request_id=request_id
+                        question, assistant.build_context(auction, bid_count, now, wallet, extra), request_id=request_id
                     )
                     if reply.request_id and reply.request_id != request_id:
                         log.warning("LLM reply for request %s came back as %s", request_id, reply.request_id)
                     log.info("assistant request %s answered by the LLM node (sources: %s)",
                              request_id, ", ".join(reply.sources) or "none")
                     answer = reply.answer
+                    # The model is fluent, not reliable. An answer about a result is
+                    # fact-checked (as recaps are) and replaced by the record if it
+                    # names the wrong winner; and the facts a person acts on are
+                    # restated underneath, straight from the replicated state.
+                    if closed_lot and not assistant.result_answer_ok(answer, settlement, asker):
+                        log.info("assistant request %s failed the result check, the record was sent instead: %r",
+                                 request_id, answer)
+                        answer = "My first answer didn't match the record, so here is the record instead."
+                    elif auction is None and assistant.wrongly_crowns_asker(
+                            answer, asker, any(s.get("winner_id") == user_id for s in settlements.values())):
+                        log.info("assistant request %s credited the asker with a win, the record was sent instead: %r",
+                                 request_id, answer)
+                        answer = "My first answer didn't match the record, so here is the record instead."
                     if auction is not None:
-                        # The model is fluent, not reliable: the facts a bidder acts on
-                        # are restated underneath, straight from the auction.
-                        answer = f"{answer}\n\n{assistant.fine_print(auction, bid_count, now)}"
+                        answer = f"{answer}\n\n{assistant.fine_print(auction, bid_count, now, outcome)}"
+                    elif assistant.about_results(question):
+                        answer = f"{answer}\n\n{assistant.floor_fine_print(auctions, settlements)}"
                     return auction_pb2.AskAssistantResponse(
                         success=True, answer=answer, from_fallback=False, sources=list(reply.sources)
                     )
@@ -494,7 +528,7 @@ class AuctionServiceServicer(RaftWriter, auction_pb2_grpc.AuctionServiceServicer
                     log.warning("LLM node unavailable for AskAssistant (%s) - answering from facts", exc.code())
 
             return auction_pb2.AskAssistantResponse(
-                success=True, answer=assistant.fallback_answer(auction, bid_count, now, wallet), from_fallback=True
+                success=True, answer=assistant.fallback_answer(auction, bid_count, now, wallet, extra), from_fallback=True
             )
 
         except Exception:

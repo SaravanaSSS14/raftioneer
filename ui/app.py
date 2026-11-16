@@ -9,10 +9,10 @@ Docker (to kill / freeze / restart nodes) and for the test suites. Run it on
 the machine running `docker compose`, with the stack up and the stubs
 generated (./scripts/generate_protos.sh).
 
-Three tabs:
-  Auction floor   sign in, bid, ask Tapri, sell, wallet and escrow
-  Raft cluster    roles, terms, each node's log, kill/freeze/restart, elections
-  Proof           the test suites and check scripts, run live
+Three tabs, and Tapri (the assistant) on all of them:
+  Floor      sign in, bid, sell, wallet and escrow
+  Cluster    all five nodes, roles, terms, each node's log, kill/freeze/restart
+  Evidence   every claim with the check behind it, run live
 """
 import argparse
 import asyncio
@@ -24,6 +24,7 @@ from backend import Session, snapshots
 from cluster_view import ClusterView
 from floor import Floor
 from proof_view import ProofView
+from tapri import Tapri
 
 _pollers: list[asyncio.Task] = []
 
@@ -38,43 +39,57 @@ app.on_startup(start_pollers)
 
 @ui.page("/")
 def index(tab: str = "floor") -> None:
-    """tab = floor, cluster or proof (e.g. /?tab=cluster for a second window)."""
+    """tab = floor, cluster or evidence (e.g. /?tab=cluster for a second window)."""
     theme.install()
     session = Session()
 
-    with ui.header().classes("bg-slate-900 items-center px-6 py-2 gap-4 no-wrap"):
-        ui.icon("gavel").classes("text-amber-400 text-3xl")
-        with ui.column().classes("gap-0"):
-            ui.label("Raftioneer").classes("text-xl font-bold text-white leading-tight")
-            ui.label("Campus clearance auction · gRPC · Raft · LLM").classes("text-xs text-slate-400")
+    tapri = Tapri(session)  # the assistant's side panel; its button sits in the header
+
+    with ui.header().classes("rt-header items-center px-6 py-2 gap-3 no-wrap").props("elevated=false"):
+        # The logo is the cluster: the amber dot is whoever leads right now.
+        logo = ui.html(theme.logo_svg(), sanitize=False).tooltip(
+            "The logo is the cluster - the amber dot is the current leader")
+        with ui.column().classes("gap-[3px]"):
+            ui.label("raftioneer").classes("rt-wordmark")
+            ui.label("campus clearance auction").classes("rt-label").style("font-size:9.5px")
         ui.space()
-        with ui.tabs().props("dense no-caps active-color=amber-4 indicator-color=amber-4") \
-                .classes("text-slate-200") as tabs:
-            floor_tab = ui.tab("floor", "Auction floor", icon="storefront")
-            cluster_tab = ui.tab("cluster", "Raft cluster", icon="hub")
-            proof_tab = ui.tab("proof", "Proof", icon="verified")
+        with ui.tabs().props("dense no-caps active-color=primary indicator-color=accent") as tabs:
+            floor_tab = ui.tab("floor", "Floor")
+            cluster_tab = ui.tab("cluster", "Cluster")
+            proof_tab = ui.tab("proof", "Evidence")
         ui.space()
-        with ui.row().classes("items-center gap-2 no-wrap"):
+        with ui.row().classes("items-center gap-3 no-wrap"):
             live = ui.element("div").classes("rt-live")
-            status = ui.label("connecting…").classes("text-sm text-slate-300")
+            status = ui.label("connecting…").classes("text-xs rt-mono rt-muted")
+            tapri.button()
+
+    logo_roles: dict = {}
 
     def header_status() -> None:
         snap = snapshots.cluster
         up = sum(1 for s in snap.nodes.values() if s is not None)
         if snap.leader:
-            status.set_text(f"{up}/3 up · leader {snap.leader} · term {snap.term}")
+            status.set_text(f"term {snap.term} · leader {snap.leader} · {up}/3 up")
             live.classes(remove="rt-bad")
         else:
-            status.set_text(f"{up}/3 up · no leader")
+            status.set_text(f"no leader · {up}/3 up")
             live.classes(add="rt-bad")
+        roles = {node: ("DOWN" if s is None else s.role) for node, s in snap.nodes.items()}
+        if snap.leader:  # an old leader that has not stepped down yet is not the leader
+            roles = {node: ("FOLLOWER" if role == "LEADER" and node != snap.leader else role)
+                     for node, role in roles.items()}
+        if roles != logo_roles:
+            logo_roles.clear()
+            logo_roles.update(roles)
+            logo.set_content(theme.logo_svg(roles))
 
     ui.timer(0.5, header_status)
 
-    first = {"cluster": cluster_tab, "proof": proof_tab}.get(tab, floor_tab)
+    first = {"cluster": cluster_tab, "proof": proof_tab, "evidence": proof_tab}.get(tab, floor_tab)
     with ui.tab_panels(tabs, value=first, animated=False) \
             .classes("w-full max-w-[1440px] mx-auto bg-transparent"):
         with ui.tab_panel(floor_tab).classes("px-2"):
-            Floor(session)
+            Floor(session, tapri)
         with ui.tab_panel(cluster_tab).classes("px-2"):
             ClusterView()
         with ui.tab_panel(proof_tab).classes("px-2 gap-4"):
@@ -89,4 +104,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     # storage_secret signs the per-browser storage that keeps a sign-in across
     # page reloads (a local demo, so a fixed value is fine).
     ui.run(title="Raftioneer", host=args.host, port=args.port, reload=False, show=False,
-           favicon="🔨", reconnect_timeout=10, storage_secret="raftioneer-demo-dashboard")
+           favicon=theme.FAVICON, reconnect_timeout=10, storage_secret="raftioneer-demo-dashboard")

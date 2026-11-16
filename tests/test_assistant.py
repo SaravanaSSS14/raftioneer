@@ -211,3 +211,102 @@ def test_the_askers_wallet_reaches_the_context():
     wallet = assistant.wallet_facts("asha", 1000.0, 0.0, 0.0)
     text = assistant.build_context(_auction(), 0, NOW_MS, wallet)
     assert "The person asking: asha" in text and "Item:" in text
+
+
+# ---- what Tapri is told about history: bids, results, the floor ----
+
+def test_bid_history_lists_bids_in_order_and_says_how_many():
+    bids = [{"bidder_name": f"b{i}", "bidder_id": f"user_b{i}", "amount": 100.0 + i} for i in range(8)]
+    text = assistant.bid_history_facts(bids, limit=3)
+    assert "the last 3 of 8" in text
+    assert text.index("b5 bid") < text.index("b7 bid")
+    assert "b4 bid" not in text
+    assert assistant.bid_history_facts([]) == "Bid history: no bids were placed"
+
+
+def test_outcome_of_a_sold_lot_names_the_winner_price_and_escrow():
+    settlement = {"winner_id": "user_nahush", "final_price": 250.0, "buyers_premium": 12.5,
+                  "escrow_status": assistant.ESCROW_HELD}
+    text = assistant.outcome_facts(_auction(status="CLOSED"), settlement)
+    assert "sold to nahush for Rs 250.00" in text
+    assert "Rs 12.50" in text and "HELD" in text
+    released = assistant.outcome_facts(_auction(status="CLOSED"), dict(settlement, escrow_status="RELEASED"))
+    assert "the seller has been paid" in released
+
+
+def test_outcome_covers_no_sale_and_open_lots():
+    no_sale = {"winner_id": None, "final_price": 0.0, "buyers_premium": 0.0, "escrow_status": assistant.ESCROW_NO_SALE}
+    assert "no sale" in assistant.outcome_facts(_auction(status="CLOSED"), no_sale)
+    assert assistant.outcome_facts(_auction(), None) == ""
+
+
+def test_floor_facts_cover_open_and_closed_lots_and_skip_script_lots():
+    auctions = [
+        dict(_auction(current_highest_bid=120.0), auction_id="a1", title="Table fan"),
+        dict(_auction(status="CLOSED"), auction_id="a2", title="Fest hoodie"),
+        dict(_auction(status="CLOSED"), auction_id="a3", title="Stress-test item"),
+    ]
+    settlements = {"a2": {"winner_id": "user_karan", "final_price": 300.0}}
+    text = assistant.floor_facts(auctions, settlements)
+    assert "Lots still open (running now, no winner yet): 1" in text
+    assert "OPEN: Table fan - highest bid so far Rs 120.00" in text
+    assert "Lots that have closed: 1" in text and "CLOSED: Fest hoodie - won by karan for Rs 300.00" in text
+    assert "Stress-test" not in text
+
+
+def test_fine_print_of_a_closed_lot_states_the_result():
+    text = assistant.fine_print(_auction(status="CLOSED"), 2, NOW_MS, "Result: sold to karan for Rs 300.00")
+    assert "closed" in text and "sold to karan" in text
+
+
+def test_extra_facts_go_into_the_context():
+    text = assistant.build_context(None, 0, NOW_MS, extra="Closed lots so far: 2")
+    assert "Closed lots so far: 2" in text and "buyer's premium" in text
+
+
+def test_outcome_says_whether_the_asker_is_the_winner():
+    settlement = {"winner_id": "user_nahush", "final_price": 250.0, "buyers_premium": 12.5,
+                  "escrow_status": assistant.ESCROW_HELD}
+    assert "The winner is nahush, not parm" in assistant.outcome_facts(_auction(status="CLOSED"), settlement, "parm")
+    assert "(nahush) is the winner" in assistant.outcome_facts(_auction(status="CLOSED"), settlement, "nahush")
+
+
+def test_result_check_wants_the_real_winner_and_not_the_asker():
+    settlement = {"winner_id": "user_mrudul", "final_price": 1.85}
+    assert assistant.result_answer_ok("Mrudul won it for Rs 1.85.", settlement, "parm")
+    assert not assistant.result_answer_ok("Parm won the auction for Rs 1.85.", settlement, "parm")
+    assert not assistant.result_answer_ok("Mrudul beat Parm to it.", settlement, "parm")
+    assert assistant.result_answer_ok("Parm won it for Rs 1.85.", {"winner_id": "user_parm"}, "parm")
+
+
+def test_result_check_catches_a_seller_paid_while_escrow_is_held():
+    held = {"winner_id": "user_nisargh", "final_price": 253.16, "escrow_status": assistant.ESCROW_HELD}
+    assert not assistant.result_answer_ok("Nisargh won it, and the seller was paid.", held, "parm")
+    assert assistant.result_answer_ok("Nisargh won it; the seller is paid when nisargh confirms receipt.", held, "parm")
+    released = dict(held, escrow_status="RELEASED")
+    assert assistant.result_answer_ok("Nisargh won it, and the seller has been paid.", released, "parm")
+
+
+def test_result_check_for_a_no_sale():
+    no_sale = {"winner_id": None}
+    assert assistant.result_answer_ok("No sale - nobody won, no bid met the reserve.", no_sale, "parm")
+    assert not assistant.result_answer_ok("Karan won it for Rs 9,000.", no_sale, "parm")
+
+
+def test_general_answer_must_not_crown_the_asker():
+    assert assistant.wrongly_crowns_asker("Parm won these lots.", "parm", asker_won_something=False)
+    assert not assistant.wrongly_crowns_asker("Parm won these lots.", "parm", asker_won_something=True)
+    assert not assistant.wrongly_crowns_asker("Mrudul won the kettle.", "parm", asker_won_something=False)
+
+
+def test_floor_fine_print_lists_the_closed_lots():
+    auctions = [dict(_auction(status="CLOSED"), auction_id="a2", title="Fest hoodie")]
+    text = assistant.floor_fine_print(auctions, {"a2": {"winner_id": "user_karan", "final_price": 300.0}})
+    assert "Fest hoodie - won by karan for Rs 300.00" in text
+    assert "no lot has closed yet" in assistant.floor_fine_print([], {})
+
+
+def test_question_routing_words():
+    assert assistant.about_results("What sold recently?") and not assistant.about_results("How does escrow work?")
+    assert assistant.about_wallet("How much can I bid with my wallet?")
+    assert not assistant.about_wallet("Which lots have closed?")

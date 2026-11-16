@@ -96,21 +96,157 @@ def wallet_facts(username: str, balance: float, committed: float, in_escrow: flo
     ])
 
 
-def build_context(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "") -> str:
+def person(user_id: Optional[str]) -> str:
+    """user_nahush -> nahush (ids are "user_" + the username)."""
+    return (user_id or "").removeprefix("user_")
+
+
+def bid_history_facts(bids: list[dict], limit: int = 6) -> str:
+    """The bids on one auction, in the order they were accepted (the newest
+    `limit` of them) - so "who bid, and how did it go?" has an answer."""
+    if not bids:
+        return "Bid history: no bids were placed"
+    shown = bids[-limit:]
+    lines = [f"{b.get('bidder_name') or person(b.get('bidder_id'))} bid {money(float(b['amount']))}" for b in shown]
+    which = f"all {len(bids)}" if len(shown) == len(bids) else f"the last {len(shown)} of {len(bids)}"
+    return f"Bid history, oldest first ({which}): " + "; ".join(lines)
+
+
+def outcome_facts(auction: dict, settlement: Optional[dict], asker: str = "") -> str:
+    """How a closed auction ended, from its settlement. With `asker` given,
+    it also says outright whether the person asking is the winner - a small
+    model otherwise tends to make the asker the hero of every answer."""
+    if auction["status"] == "ACTIVE":
+        return ""
+    if settlement is None:
+        return "Result: closed, settlement still being recorded"
+    if not settlement.get("winner_id"):
+        return "Result: no sale - no bid met the rules, nothing was charged"
+    status = str(settlement["escrow_status"]).replace(" (mock)", "")
+    paid = "the seller has been paid" if status == "RELEASED" else "the seller is paid when the winner confirms receipt"
+    winner = person(settlement["winner_id"])
+    text = (
+        f"Result: sold to {winner} for {money(float(settlement['final_price']))} "
+        f"plus {money(float(settlement['buyers_premium']))} buyer's premium. Escrow: {status} - {paid}"
+    )
+    if asker:
+        text += (f". The person asking ({asker}) is the winner" if asker == winner
+                 else f". The winner is {winner}, not {asker} (the person asking)")
+    return text
+
+
+# Lots created by the project's own check scripts (stress, chaos, failover,
+# contract tests, benchmark). They are real auctions, but a question like
+# "what sold recently?" is about the campus items, so the floor summary
+# leaves them out. Asking about one of them directly still works.
+SCRIPT_LOT_PREFIXES = ("pytest ", "Stress-test item", "Chaos-run item", "Failover-check item", "Benchmark item")
+
+
+def floor_facts(auctions: list[dict], settlements: dict[str, dict], limit: int = 6) -> str:
+    """The whole floor in a few lines, for a question that is not about one
+    auction: what is open now, and how the most recent lots ended.
+    `settlements` maps auction id -> settlement row (closed lots only)."""
+    lots = [a for a in auctions if not str(a["title"]).startswith(SCRIPT_LOT_PREFIXES)]
+    open_lots = sorted((a for a in lots if a["status"] == "ACTIVE"), key=lambda a: a["end_time_ms"])
+    closed = sorted((a for a in lots if a["status"] != "ACTIVE"), key=lambda a: a["end_time_ms"], reverse=True)
+    lines = [f"Lots still open (running now, no winner yet): {len(open_lots)}"]
+    for a in open_lots[:limit]:
+        highest = float(a["current_highest_bid"] or 0.0)
+        lines.append(f"- OPEN: {a['title']} - " + (f"highest bid so far {money(highest)}" if highest > 0 else "no bids yet"))
+    lines.append(f"Lots that have closed: {len(closed)}" + (f" (the latest {limit} listed)" if len(closed) > limit else ""))
+    for line in closed_lot_lines(closed[:limit], settlements):
+        lines.append(f"- CLOSED: {line}")
+    return "\n".join(lines)
+
+
+def closed_lot_lines(closed: list[dict], settlements: dict[str, dict]) -> list[str]:
+    lines = []
+    for a in closed:
+        s = settlements.get(a["auction_id"])
+        if s is None:
+            lines.append(f"{a['title']} - being settled")
+        elif not s.get("winner_id"):
+            lines.append(f"{a['title']} - no sale")
+        else:
+            lines.append(f"{a['title']} - won by {person(s['winner_id'])} for {money(float(s['final_price']))}")
+    return lines
+
+
+def floor_fine_print(auctions: list[dict], settlements: dict[str, dict], limit: int = 6) -> str:
+    """The closed lots, restated under an answer about results - the same
+    idea as fine_print(): the record is shown next to the model's sentence."""
+    lots = [a for a in auctions if not str(a["title"]).startswith(SCRIPT_LOT_PREFIXES)]
+    closed = sorted((a for a in lots if a["status"] != "ACTIVE"), key=lambda a: a["end_time_ms"], reverse=True)
+    if not closed:
+        return "Fine print, from the floor rather than the model: no lot has closed yet."
+    return ("Fine print, from the floor rather than the model: " + "; ".join(closed_lot_lines(closed[:limit], settlements))
+            + ".")
+
+
+_RESULT_WORDS = ("sold", "won", "win", "winner", "closed", "result", "recent", "history", "went for", "bought")
+_WALLET_WORDS = ("wallet", "afford", "balance", "fund", "money", "escrow", "can i bid", "how much can", "my ", "pay")
+
+
+def about_results(question: str) -> bool:
+    """Is this question about how lots ended? (Decides whether the floor's
+    fine print goes under the answer.)"""
+    q = question.lower()
+    return any(word in q for word in _RESULT_WORDS)
+
+
+def about_wallet(question: str) -> bool:
+    """Is the asker's own wallet relevant? It is left out of the context
+    otherwise: handed a wallet, the model works it into every answer."""
+    q = question.lower()
+    return any(word in q for word in _WALLET_WORDS)
+
+
+def result_answer_ok(answer: str, settlement: Optional[dict], asker: str) -> bool:
+    """A fact check for an answer about a closed lot, like recap_matches_facts
+    for recaps: it must name the real winner, and must not bring the asker in
+    as one when they are not. A no-sale must not be described as a win."""
+    text = answer.lower()
+    # Escrow: while it is held the seller has not been paid yet - a small model
+    # tends to finish the story ("...and the seller was paid") anyway.
+    if settlement and "HELD" in str(settlement.get("escrow_status", "")) and re.search(
+            r"seller (was|has been|got|has already been) paid|paid the seller|escrow (was|has been) released", text):
+        return False
+    winner = person(settlement.get("winner_id")) if settlement else ""
+    if not winner:
+        return not re.search(r"\bwon\b(?! nothing)", text.replace("did not win", "").replace("no one won", "")
+                             .replace("nobody won", ""))
+    if winner.lower() not in text:
+        return False
+    return asker == winner or asker.lower() not in text
+
+
+def wrongly_crowns_asker(answer: str, asker: str, asker_won_something: bool) -> bool:
+    """True if a general answer says the asker won a lot when they won none."""
+    if asker_won_something or not asker:
+        return False
+    return re.search(rf"\b{re.escape(asker.lower())}\b[^.]*\bwon\b", answer.lower()) is not None
+
+
+def build_context(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "",
+                  extra: str = "") -> str:
     """Reference context for an LLM answer: the rules, plus the auction and
-    the asker's wallet if given."""
+    the asker's wallet if given. `extra` carries more live facts - an
+    auction's bid history and result, or the floor summary."""
     parts = [auction_facts(auction, bid_count, now_ms)] if auction is not None else []
+    if extra:
+        parts.append(extra)
     if wallet:
         parts.append(wallet)
     parts.append(platform_rules())
     return "\n\n".join(parts)
 
 
-def fallback_answer(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "") -> str:
+def fallback_answer(auction: Optional[dict], bid_count: int, now_ms: float, wallet: str = "",
+                    extra: str = "") -> str:
     return (
         "Tapri is offline on a chai break (the LLM node isn't answering), so here are the plain "
         "facts - less charming, entirely accurate.\n"
-        + build_context(auction, bid_count, now_ms, wallet)
+        + build_context(auction, bid_count, now_ms, wallet, extra)
     )
 
 
@@ -121,13 +257,14 @@ def fallback_description(title: str) -> str:
     )
 
 
-def fine_print(auction: dict, bid_count: int, now_ms: float) -> str:
+def fine_print(auction: dict, bid_count: int, now_ms: float, outcome: str = "") -> str:
     """The facts that matter for a bid, read from the auction itself and
     appended to the model's answer - so even when the model gets one wrong
     (it once told a bidder to go "a little above 0" past a Rs 800 reserve),
     the correct figure is right there underneath."""
     if auction["status"] != "ACTIVE":
-        return f"Fine print, from the auction rather than the model: this auction is {auction['status'].lower()}."
+        ending = f" {outcome}." if outcome else ""
+        return f"Fine print, from the auction rather than the model: this auction is {auction['status'].lower()}.{ending}"
     highest = float(auction["current_highest_bid"] or 0.0)
     reserve = float(auction.get("reserve_price") or 0.0)
     seconds_left = max(0, int((auction["end_time_ms"] - now_ms) / 1000))

@@ -12,18 +12,59 @@ import ops
 import theme
 from backend import NODES, cluster, snapshots
 
-# Where each node sits in the diagram (a triangle).
-POSITIONS = {"app-server-1": (110, 175), "app-server-2": (300, 62), "app-server-3": (490, 175)}
+# Where each node sits in the diagram: the three app servers form a triangle
+# (the same one as the logo), the client node is on the left, the LLM node on
+# the right.
+POSITIONS = {"app-server-1": (300, 80), "app-server-2": (300, 226), "app-server-3": (452, 153)}
+CLIENT_AT, LLM_AT = (84, 153), (676, 153)
+BOX_W, BOX_H = 112, 64
 
 
-def diagram_svg(roles: dict[str, str], terms: dict[str, int], leader: str | None) -> str:
-    """Three nodes; heartbeat dots flow from the leader to every live follower."""
-    parts = ['<svg viewBox="0 0 600 250" width="100%" style="max-height:260px">']
+def _box(x: int, y: int, colour: str, title: str, subtitle: str) -> str:
+    return (f'<rect x="{x - BOX_W // 2}" y="{y - BOX_H // 2}" width="{BOX_W}" height="{BOX_H}" rx="10" '
+            f'fill="{colour}"/>'
+            f'<text x="{x}" y="{y - 3}" text-anchor="middle" font-size="14" fill="white" font-weight="700">{title}</text>'
+            f'<text x="{x}" y="{y + 15}" text-anchor="middle" font-size="10.5" fill="white" opacity=".9">{subtitle}</text>')
+
+
+def _caption(x: int, y: int, text: str) -> str:
+    return f'<text x="{x}" y="{y}" text-anchor="middle" font-size="11" fill="{theme.MUTED}">{text}</text>'
+
+
+def diagram_svg(roles: dict[str, str], terms: dict[str, int], leader: str | None,
+                client_state: str = "running", llm_state: str = "running") -> str:
+    """All five nodes. Amber dots are the leader's heartbeats to each live
+    follower; dark dots are the client node's bids, which go to whoever leads
+    (so they change course when the leader does). The LLM node sits outside
+    the cluster: asked over gRPC, never part of deciding a bid."""
+    parts = ['<svg viewBox="0 0 760 300" width="100%" style="max-height:310px">']
+    # the Raft cluster's outline
+    parts.append(f'<rect x="232" y="30" width="290" height="262" rx="18" fill="none" stroke="{theme.LINE}" '
+                 'stroke-width="2" stroke-dasharray="7 5"/>')
+    parts.append(_caption(377, 20, "Raft cluster - three app servers, one replicated log"))
     nodes = list(POSITIONS)
     for i, a in enumerate(nodes):
         for b in nodes[i + 1:]:
             (x1, y1), (x2, y2) = POSITIONS[a], POSITIONS[b]
-            parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#e2e8f0" stroke-width="3"/>')
+            parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{theme.LINE}" stroke-width="3"/>')
+
+    # client node -> leader: bids
+    cx, cy = CLIENT_AT
+    bidding = client_state == "running" and leader is not None
+    if bidding:
+        lx, ly = POSITIONS[leader]
+        parts.append(f'<line x1="{cx + BOX_W // 2}" y1="{cy}" x2="{lx}" y2="{ly}" stroke="{theme.INK}" '
+                     'stroke-width="1.5" opacity=".35"/>')
+        for delay in (0, 0.8):
+            parts.append(f'<circle r="4.5" fill="{theme.INK}"><animateMotion dur="1.6s" begin="{delay}s" '
+                         f'repeatCount="indefinite" path="M{cx + BOX_W // 2},{cy} L{lx},{ly}"/></circle>')
+    # cluster -> LLM node
+    gx, gy = LLM_AT
+    llm_up = llm_state == "running"
+    parts.append(f'<line x1="522" y1="{gy}" x2="{gx - BOX_W // 2}" y2="{gy}" stroke="{theme.CHAI if llm_up else theme.DOWN}" '
+                 'stroke-width="2" stroke-dasharray="5 4"/>')
+
+    # leader -> followers: heartbeats
     if leader:
         lx, ly = POSITIONS[leader]
         for node in nodes:
@@ -32,7 +73,7 @@ def diagram_svg(roles: dict[str, str], terms: dict[str, int], leader: str | None
             fx, fy = POSITIONS[node]
             for delay in (0, 0.45):
                 parts.append(
-                    f'<circle r="6" fill="{theme.LEADER}" opacity="0.9">'
+                    f'<circle r="5" fill="{theme.LEADER}" opacity="0.95">'
                     f'<animateMotion dur="0.9s" begin="{delay}s" repeatCount="indefinite" '
                     f'path="M{lx},{ly} L{fx},{fy}"/></circle>'
                 )
@@ -40,23 +81,67 @@ def diagram_svg(roles: dict[str, str], terms: dict[str, int], leader: str | None
         x, y = POSITIONS[node]
         role = roles.get(node, "DOWN")
         colour = theme.role_colour(role)
-        if role == "LEADER":
-            parts.append(f'<circle cx="{x}" cy="{y}" r="44" fill="{colour}" opacity="0.25">'
-                         '<animate attributeName="r" values="40;56;40" dur="1.5s" repeatCount="indefinite"/>'
-                         '<animate attributeName="opacity" values="0.35;0;0.35" dur="1.5s" repeatCount="indefinite"/>'
-                         '</circle>')
         dash = ' stroke-dasharray="6 4"' if role == "CANDIDATE" else ""
-        parts.append(f'<circle cx="{x}" cy="{y}" r="38" fill="{colour}" stroke="white" stroke-width="4"{dash}/>')
+        parts.append(f'<circle cx="{x}" cy="{y}" r="33" fill="{colour}" stroke="{theme.CARD}" stroke-width="4"{dash}/>')
         icon = {"LEADER": "♛", "DOWN": "✕", "FROZEN": "❄", "CANDIDATE": "?"}.get(role, "")
-        parts.append(f'<text x="{x}" y="{y - 4}" text-anchor="middle" font-size="22" fill="white" '
+        parts.append(f'<text x="{x}" y="{y - 3}" text-anchor="middle" font-size="20" fill="white" '
                      f'font-weight="700">{icon or node[-1]}</text>')
-        parts.append(f'<text x="{x}" y="{y + 18}" text-anchor="middle" font-size="11" fill="white" '
+        parts.append(f'<text x="{x}" y="{y + 15}" text-anchor="middle" font-size="10.5" fill="white" '
                      f'font-weight="600">{role.lower()}</text>')
         label = node + (f" · term {terms[node]}" if node in terms else "")
-        parts.append(f'<text x="{x}" y="{y + 58}" text-anchor="middle" font-size="13" fill="#334155" '
+        parts.append(f'<text x="{x}" y="{y + 51}" text-anchor="middle" font-size="12" fill="{theme.INK}" '
                      f'font-weight="600">{label}</text>')
+
+    client_colour = {"running": theme.INK, "paused": theme.FROZEN}.get(client_state, theme.DOWN)
+    parts.append(_box(cx, cy, client_colour, "bidders", "client node"))
+    parts.append(_caption(cx, cy + 50, "nisargh · nahush · karan · mrudul"))
+    parts.append(_caption(cx, cy + 65, "bids go to the leader" if bidding
+                          else "switched off" if client_state != "running" else "waiting for a leader"))
+    parts.append(_box(gx, gy, theme.CHAI if llm_up else theme.DOWN, "Tapri", "LLM node"))
+    parts.append(_caption(gx, gy + 50, "asked over gRPC for answers,"))
+    parts.append(_caption(gx, gy + 65, "descriptions and recaps" if llm_up else "DOWN - templates are used instead"))
+    parts.append(_caption((522 + gx - BOX_W // 2) // 2, gy - 8, "gRPC"))
     parts.append("</svg>")
     return "".join(parts)
+
+
+class ServiceSwitch:
+    """An on/off switch for a container that is not a Raft member (the client
+    node, the LLM node). It mirrors the container's real state, and ignores
+    the state poll while its own change is still being carried out."""
+
+    def __init__(self, view: "ClusterView", service: str, label: str, tip: str, what: str) -> None:
+        self.view, self.service, self.what = view, service, what
+        self.switching = False
+        self.switch = ui.switch(label, value=True, on_change=self._toggled).props("dense color=primary")
+        self.switch.tooltip(tip)
+
+    def sync(self, states: dict[str, str]) -> None:
+        if self.switching:
+            return  # mid-change: syncing now would flip the switch back for a moment
+        running = states.get(self.service) == "running"
+        if running != self.switch.value:
+            self.switch.set_value(running)  # mirror what another tab (or the terminal) did
+
+    async def _toggled(self, event) -> None:
+        # Only act when the switch disagrees with the container: a switch that
+        # is merely being synced to the real state must not act again.
+        state = self.view.docker.get(self.service, "")
+        if self.switching or event.value == (state == "running"):
+            return
+        self.switching = True
+        self.switch.disable()
+        try:
+            code, out = await ops.set_service(self.service, event.value, state)
+        finally:
+            self.switching = False
+            self.switch.enable()
+        await self.view.poll_docker()
+        if code == 0:
+            snapshots.event("info", f"{self.what} {'started' if event.value else 'stopped'} from the UI")
+            ui.notify(f"{self.what} {'on' if event.value else 'off'}", type="info")
+        else:
+            ui.notify(f"docker: {out.strip()[:200]}", type="negative")
 
 
 class NodeCard:
@@ -140,7 +225,6 @@ class ClusterView:
         self.events_seen = -1
         self.docker: dict[str, str] = {}
         self.diagram_key = None
-        self.switching = False  # a bidders-switch flip is in progress
         self._build()
         ui.timer(0.5, self.tick)
         ui.timer(2.0, self.poll_docker)
@@ -150,18 +234,31 @@ class ClusterView:
             with ui.column().classes("grow gap-4 min-w-0"):
                 with ui.card().classes("rt-card w-full p-5 gap-2"):
                     with ui.row().classes("w-full items-center gap-3"):
-                        ui.label("Raft cluster").classes("text-xl font-bold")
+                        ui.label("The cluster").classes("rt-title")
                         self.live = ui.element("div").classes("rt-live")
-                        self.headline = ui.label().classes("rt-muted")
                         ui.space()
                         ui.button("Kill the leader", icon="bolt", on_click=self.kill_leader) \
                             .props("unelevated color=negative")
                         ui.button("Restart all", icon="restart_alt", on_click=self.restart_all).props("flat")
-                    with ui.row().classes("w-full items-center gap-2"):
-                        self.bidders = ui.switch("Simulated bidders (client node)", value=True,
-                                                 on_change=self._toggle_bidders).props("dense color=primary")
-                        self.bidders.tooltip("Node 5's personas (nisargh, nahush, karan, mrudul) bid on their own. "
-                                             "Switch them off to demo bidding by hand.")
+                    # The cluster's state at a glance, large enough to read from the back.
+                    with ui.row().classes("w-full gap-0 no-wrap my-1").style(
+                            f"border:1px solid {theme.LINE}; border-radius:8px"):
+                        self.stats = {}
+                        for key, label in [("leader", "leader"), ("term", "term"), ("up", "nodes up"),
+                                           ("commit", "commit index"), ("election", "last election")]:
+                            with ui.column().classes("gap-0 px-4 py-2 grow basis-0").style(
+                                    "" if key == "leader" else f"border-left:1px solid {theme.LINE}"):
+                                ui.label(label).classes("rt-label")
+                                self.stats[key] = ui.label("–").classes("rt-mono font-bold text-[22px] leading-tight")
+                    with ui.row().classes("w-full items-center gap-6"):
+                        self.switches = [
+                            ServiceSwitch(self, "client", "Simulated bidders",
+                                          "Node 5, the client node: four personas bidding on their own.",
+                                          "simulated bidders"),
+                            ServiceSwitch(self, "llm_server", "LLM node (Tapri)",
+                                          "Node 1, the LLM service behind Tapri. While it is off, answers, "
+                                          "descriptions and recaps come from templates.", "LLM node"),
+                        ]
                     self.diagram = ui.html("", sanitize=False).classes("w-full")
                     self.banner = ui.label().classes("text-center w-full text-base font-semibold")
                 with ui.row().classes("w-full gap-4 no-wrap max-xl:flex-wrap"):
@@ -175,13 +272,13 @@ class ClusterView:
                         .classes("text-sm rt-muted")
             with ui.column().classes("w-[340px] shrink-0 gap-4 max-lg:w-full"):
                 with ui.card().classes("rt-card w-full p-4 gap-2"):
-                    ui.label("What just happened").classes("font-semibold")
+                    ui.label("What just happened").classes("rt-label")
                     self.events = ui.column().classes("w-full gap-1")
                 self._legend()
 
     @staticmethod
     def _legend() -> None:
-        """What every colour and label on this tab means."""
+        """The legend: what every colour and label on this tab means."""
         def swatch(colour: str, text: str, dashed: bool = False) -> None:
             with ui.row().classes("items-center gap-2 no-wrap"):
                 border = f"border:2px dashed {colour}; background:transparent" if dashed else f"background:{colour}"
@@ -189,26 +286,28 @@ class ClusterView:
                 ui.label(text).classes("text-sm")
 
         with ui.card().classes("rt-card w-full p-4 gap-2"):
-            ui.label("Reading this page").classes("font-semibold")
+            ui.label("Legend").classes("rt-label")
 
-            ui.label("Nodes (circles and badges)").classes("text-xs font-semibold rt-muted mt-1")
-            swatch(theme.LEADER, "leader ♛ - the only node that accepts writes; its card has an amber ring")
+            ui.label("Nodes (circles and badges)").classes("text-xs font-semibold mt-1")
+            swatch(theme.LEADER, "leader ♛ - the only node that accepts writes; its card has an amber border")
             swatch(theme.FOLLOWER, "follower - copies the leader's log, serves reads")
             swatch(theme.CANDIDATE, "candidate ? - its election timer ran out; asking for votes", dashed=True)
             swatch(theme.FROZEN, "frozen ❄ - docker pause: alive but gets no CPU (a zombie)")
             swatch(theme.DOWN, "down ✕ - container killed or not answering")
             ui.label("Amber dots moving from the leader to a follower are its heartbeats "
-                     "(AppendEntries, every 0.2 s). A follower that stops hearing them starts an election.") \
+                     "(AppendEntries, every 0.2 s). A follower that stops hearing them starts an election. "
+                     "Dark dots are the bidders' writes: they go to whoever leads, so they change course after "
+                     "an election. The LLM node is outside the cluster - it is asked, it never decides.") \
                 .classes("text-sm rt-muted")
 
-            ui.label("Node card numbers").classes("text-xs font-semibold rt-muted mt-2")
+            ui.label("Node card numbers").classes("text-xs font-semibold mt-2")
             ui.label("term - the election period the node believes it is in (goes up with each election). "
                      "log - index of its newest entry. commit - newest entry known to be on a majority. "
                      "applied - newest entry run on its auction database. log > commit means entries are "
                      "waiting for a majority; commit > applied means it is catching up.") \
                 .classes("text-sm")
 
-            ui.label("Log entries (squares, newest on the right)").classes("text-xs font-semibold rt-muted mt-2")
+            ui.label("Log entries (squares, newest on the right)").classes("text-xs font-semibold mt-2")
             with ui.row().classes("items-center gap-2 no-wrap"):
                 ui.element("div").classes("rt-cell").style(f"background:{theme.TERM_COLOURS[1]}") \
                     .props("aria-hidden=true")
@@ -225,10 +324,10 @@ class ClusterView:
                     ui.label(str(term)).classes("text-[10px] text-white font-bold text-center rounded") \
                         .style(f"background:{colour};width:22px;line-height:18px")
                 ui.label("= term mod 8").classes("text-xs rt-muted")
-            ui.label("Small #number = the entry's log index. Hover over a square for its term and details.") \
+            ui.label("Small #number = the entry's log index; the tooltip has the term and the command.") \
                 .classes("text-sm rt-muted")
 
-            ui.label("Entry labels (the command inside)").classes("text-xs font-semibold rt-muted mt-2")
+            ui.label("Entry labels (the command inside)").classes("text-xs font-semibold mt-2")
             with ui.grid().classes("w-full gap-x-3 gap-y-0 text-sm").style("grid-template-columns: auto 1fr"):
                 for short, meaning in [
                     ("BID", "a bid (accepted or refused - both are recorded)"),
@@ -247,32 +346,8 @@ class ClusterView:
         states = await ops.container_states()
         if states:
             self.docker = states
-            # While a switch flip is still being carried out, the container is
-            # mid-change: syncing now would flip the switch back for a moment.
-            if self.switching:
-                return
-            running = states.get("client") == "running"
-            if running != self.bidders.value:
-                self.bidders.set_value(running)  # mirror what another tab (or the terminal) did
-
-    async def _toggle_bidders(self, event) -> None:
-        # Only act when the switch disagrees with the container: a switch that
-        # is merely being synced to the real state (above) must not act again.
-        if self.switching or event.value == (self.docker.get("client") == "running"):
-            return
-        self.switching = True
-        self.bidders.disable()
-        try:
-            code, out = await ops.set_simulated_bidders(event.value, self.docker.get("client", ""))
-        finally:
-            self.switching = False
-            self.bidders.enable()
-        await self.poll_docker()
-        if code == 0:
-            snapshots.event("info", f"simulated bidders {'started' if event.value else 'stopped'} from the UI")
-            ui.notify(f"Simulated bidders {'on' if event.value else 'off'}", type="info")
-        else:
-            ui.notify(f"docker: {out.strip()[:200]}", type="negative")
+            for switch in self.switches:
+                switch.sync(states)
 
     def _docker_state(self, node: str) -> str:
         return self.docker.get(ops.service_of(node), "running")
@@ -288,16 +363,23 @@ class ClusterView:
             if status is not None:
                 terms[node] = status.term
             self.cards[node].update(status, self._docker_state(node))
-        key = (tuple(sorted(roles.items())), snap.leader, tuple(sorted(terms.items())))
+        client, llm = self.docker.get("client", "running"), self.docker.get("llm_server", "running")
+        key = (tuple(sorted(roles.items())), snap.leader, tuple(sorted(terms.items())), client, llm)
         if key != self.diagram_key:
             self.diagram_key = key
-            self.diagram.set_content(diagram_svg(roles, terms, snap.leader))
+            self.diagram.set_content(diagram_svg(roles, terms, snap.leader, client, llm))
         if snap.leader:
-            self.headline.set_text(f"leader {snap.leader} · term {snap.term}")
             self.live.classes(remove="rt-bad")
         else:
-            self.headline.set_text("no leader - election in progress")
             self.live.classes(add="rt-bad")
+        live_nodes = [s for s in snap.nodes.values() if s is not None]
+        self.stats["leader"].set_text(snap.leader or "none - electing")
+        self.stats["leader"].style(f"color:{theme.LEADER if snap.leader else '#b91c1c'}")
+        self.stats["term"].set_text(str(snap.term))
+        self.stats["up"].set_text(f"{len(live_nodes)} / {len(snap.nodes) or 3}")
+        self.stats["commit"].set_text(str(max((s.commit_index for s in live_nodes), default=0)))
+        took = snapshots.last_election_seconds
+        self.stats["election"].set_text(f"{took:.2f} s" if took is not None else "–")
         self._agreement(snap)
         if snapshots.event_count != self.events_seen:
             self.events_seen = snapshots.event_count
@@ -371,6 +453,15 @@ class ClusterView:
             if leaders:
                 new = leaders[0]
                 elapsed = time.time() - started
+                # One number on the screen: the strip's "last election" shows this
+                # kill-to-new-leader time too, not the poller's own (shorter) one,
+                # which starts only when it notices the leader is gone. Set it once
+                # the poller has seen the new leader, so it cannot overwrite it.
+                for _ in range(40):
+                    if snapshots.cluster.leader == new.node_id:
+                        break
+                    await asyncio.sleep(0.05)
+                snapshots.last_election_seconds = elapsed
                 self.banner.set_text(
                     f"✔ {new.node_id} took over as leader of term {new.term}, {elapsed:.2f} s after the kill - "
                     f"commit index {new.commit_index} (was {commit}): nothing committed was lost.")

@@ -196,7 +196,7 @@ class Snapshots:
                     took = ""
                     if self.leaderless_since is not None:
                         self.last_election_seconds = time.time() - self.leaderless_since
-                        took = f" after {self.last_election_seconds:.2f}s without one"
+                        took = f" ({self.last_election_seconds:.2f} s with no leader visible here)"
                     self.leaderless_since = None
                     self.event("leader", f"{new.leader} is the leader of term {new.term}{took}")
             elif new.leader is not None and new.term > old.term:

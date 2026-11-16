@@ -47,6 +47,7 @@ services:
       context: ..
       dockerfile: llm_server/Dockerfile
     image: raftioneer-llm-server
+    init: true  # stops at once when the dashboard switches the LLM node off
     environment:
       - NODE_ID=llm-server
       - PORT=50060

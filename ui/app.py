@@ -101,7 +101,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to open it from another machine")
     args = parser.parse_args()
-    # storage_secret signs the per-browser storage that keeps a sign-in across
-    # page reloads (a local demo, so a fixed value is fine).
+    # storage_secret signs NiceGUI's storage (a local demo, so a fixed value is fine);
+    # a sign-in is kept per browser tab (floor.py).
     ui.run(title="Raftioneer", host=args.host, port=args.port, reload=False, show=False,
            favicon=theme.FAVICON, reconnect_timeout=10, storage_secret="raftioneer-demo-dashboard")

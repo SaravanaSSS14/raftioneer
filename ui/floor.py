@@ -95,18 +95,23 @@ class Floor:
         ui.timer(2.0, self.refresh_wallet)
         ui.timer(0.1, self._restore_session, once=True)
 
-    # A sign-in survives a page reload: it is kept in this browser's storage
-    # and restored if the cluster still accepts the session.
+    # A sign-in survives a page reload: it is kept in this tab's storage and
+    # restored if the cluster still accepts the session. Per tab, not per
+    # browser: with browser-wide storage a second tab inherited the first
+    # tab's sign-in, and signing out there to switch accounts ended the first
+    # tab's session on the server too (Bug 45). Now each tab can hold its own
+    # account.
 
     def _remember(self) -> None:
-        app.storage.user["session"] = {"token": self.session.token, "username": self.session.username,
+        app.storage.tab["session"] = {"token": self.session.token, "username": self.session.username,
                                        "user_id": self.session.user_id}
 
     def _forget(self) -> None:
-        app.storage.user.pop("session", None)
+        app.storage.tab.pop("session", None)
 
     async def _restore_session(self) -> None:
-        saved = app.storage.user.get("session")
+        await ui.context.client.connected()  # tab storage needs the browser connected
+        saved = app.storage.tab.get("session")
         if not saved or self.session.signed_in:
             return
         self.session.token, self.session.username, self.session.user_id = (

@@ -35,7 +35,7 @@ Project option F: Distributed Online Auction System*
 9. [Performance](#9-performance)
 10. [Configuration](#10-configuration)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Known limitations](#12-known-limitations)
+12. [Known limitations and next steps](#12-known-limitations-and-next-steps)
 13. [Repository layout](#13-repository-layout)
 14. [Team](#14-team)
 
@@ -336,7 +336,7 @@ All settings are environment variables, set per node in
 
 ---
 
-## 12. Known limitations
+## 12. Known limitations and next steps
 
 - The log is never compacted (no snapshots), so a restarted node replays it in full.
 - Reads on a follower can trail the leader by about one round trip; reads are not linearizable. A
@@ -349,6 +349,15 @@ All settings are environment variables, set per node in
 - The 1.5B model sometimes phrases things loosely; the fine print and the recap check keep the
   facts correct.
 - Payments are a mock by design, and the gRPC channels are unencrypted (local deployment).
+
+**Next steps,** roughly in order of value:
+
+1. Snapshots and log compaction (Raft Section 7), so a restart no longer replays the whole log.
+2. Check-quorum, so an isolated leader steps down on its own.
+3. Linearizable reads on followers (ReadIndex), and no answers from a follower until it has
+   heard from the leader.
+4. A `request_id` on every write, not only bids and deposits.
+5. Cluster membership changes, and TLS on the gRPC channels.
 
 ---
 

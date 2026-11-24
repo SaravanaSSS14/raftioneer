@@ -13,12 +13,12 @@ message LogEntry {
   bytes command = 3; // a state-machine command (JSON, see app_server/state_machine.py); empty = leader no-op
 }
 
-// The assignment's signatures name the sender and receiver of every Raft
-// message: requestVote(from, to, ...), appendEntries(from, to, ...) and their
-// replies. `from` is candidate_id / leader_id in a request (the paper's names)
-// and from_id in a reply; `to` is to_id. Raft itself doesn't need them - a
-// reply arrives on the call it answers - but they make every message
-// self-describing in the logs.
+// Every Raft message names its sender and receiver: requestVote(from, to,
+// ...), appendEntries(from, to, ...) and their replies. `from` is
+// candidate_id / leader_id in a request (the paper's names) and from_id in a
+// reply; `to` is to_id. Raft itself doesn't need them - a reply arrives on
+// the call it answers - but they make every message self-describing in the
+// logs.
 
 message RequestVoteRequest {
   int64 term = 1;
@@ -46,14 +46,14 @@ message AppendEntriesRequest {
   int64 prev_log_index = 3;
   int64 prev_log_term = 4;
   repeated LogEntry entries = 5; // empty = heartbeat
-  int64 leader_commit = 6;  // the assignment's commitIndex
+  int64 leader_commit = 6;  // commitIndex
   string to_id = 7;
 }
 
 message AppendEntriesResponse {
   int64 term = 1;
-  bool success = 2;         // the assignment's entryAppended
-  // The assignment's matchIndex. On success, the follower's last entry that
+  bool success = 2;         // entryAppended
+  // matchIndex. On success, the follower's last entry that
   // now matches the leader's; on a refusal, where the leader should retry
   // from (a common optimization for faster nextIndex back-off).
   int64 match_index = 3;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sample queries: a guided tour of what the running stack can do.
 
-Walks one app server through the whole M1 story - browse, ask the LLM
+Walks one app server through the whole auction story - browse, ask the LLM
 assistant, list an item with no description (the LLM writes one), bid, and
 read the outcome once the auction closes (winner, mock escrow settlement,
 recap). Doubles as the "sample queries" for the README.

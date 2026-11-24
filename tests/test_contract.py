@@ -509,7 +509,7 @@ def test_a_bid_beyond_the_bidders_funds_is_refused(leader_stub):
     assert accepted.accepted, accepted.error_message
 
 
-# ---- The assignment's generic post/get, and the Raft log view ----
+# ---- Generic post/get, and the Raft log view ----
 
 
 def test_get_returns_id_and_data_pairs(app_stub):

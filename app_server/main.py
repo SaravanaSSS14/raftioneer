@@ -5,7 +5,7 @@
     state_machine.py  what a committed log entry does to the auction data
     service.py        the gRPC AuctionService - leader-only writes, reads anywhere
     payment_service.py  the mock PaymentService - wallets, deposits, escrow
-    business_api.py   the assignment's post/get, routed by processBusinessRequest
+    business_api.py   generic post/get, routed by processBusinessRequest
     auction_timer.py  closing, settling and recapping auctions, from the leader
     main.py           this file: wires them together and starts the node
 """

@@ -5,7 +5,7 @@ package raftioneer.llm;
 // Contract for the independent LLM server (Node 1). Called by app
 // servers over gRPC only; holds no authoritative auction state.
 
-// The assignment's getLLMAnswer(requestId, query, context) ->
+// getLLMAnswer(requestId, query, context) ->
 // getLLMAnswerResponse(requestId, answer). `question` is the query.
 message GetLLMAnswerRequest {
   string question = 1;

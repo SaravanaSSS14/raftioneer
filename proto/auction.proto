@@ -215,9 +215,9 @@ message LogEntryView {
   string label = 4;  // a short human-readable line, e.g. "bid Rs 120 on 3fa2c1d0"
 }
 
-// ---- The assignment's generic client API ----
-// post(token, type, data) and get(token, type, params), as given in the
-// assignment's function signatures. Each is a front door onto the typed RPCs:
+// ---- Generic client API ----
+// post(token, type, data) and get(token, type, params): a single entry point
+// for simple clients. Each is a front door onto the typed RPCs:
 // the app server's ProcessBusinessRequest routes it by `type` to the same code
 // that serves PlaceBid, CreateAuction, GetWallet, and so on.
 
@@ -276,7 +276,7 @@ service AuctionService {
   rpc ListBids(ListBidsRequest) returns (ListBidsResponse);
   // This node's Raft role, term and view of the leader. Served by every node.
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
-  // The assignment's post(token, type, data) / get(token, type, params).
+  // Generic post(token, type, data) / get(token, type, params).
   rpc Post(PostRequest) returns (PostResponse);
   rpc Get(GetRequest) returns (GetResponse);
 }

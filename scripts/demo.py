@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The Milestone 2 demo, act by act: one command for a live presentation or
-the recorded video.
+"""The end-to-end demo, act by act: one command for a live walkthrough or
+a recording.
 
 Each act says what it is about to show, runs the script that shows it, and
 waits for Enter before the next (--auto runs straight through). Every act is
@@ -88,7 +88,7 @@ def main() -> int:
         if not args.auto and number < len(ACTS):
             input("\n  [Enter] for the next act ")
 
-    narrate.verdict(not failed, "the Milestone 2 demo" + (" ran cleanly" if not failed else f" - {', '.join(failed)}"))
+    narrate.verdict(not failed, "the demo" + (" ran cleanly" if not failed else f" - {', '.join(failed)}"))
     return 0 if not failed else 1
 
 

@@ -1,5 +1,5 @@
 """The client-facing gRPC service: accounts, listings, bidding, the
-assistant, the cluster status, and the assignment's generic post/get.
+assistant, the cluster status, and the generic post/get API.
 
 Writes (Register, Login, Logout, CreateAuction, PlaceBid) go through Raft -
 see RaftWriter. Reads are served from this node's own copy of the state.
@@ -418,7 +418,7 @@ class AuctionServiceServicer(RaftWriter, auction_pb2_grpc.AuctionServiceServicer
             ],
         )
 
-    # ---- The assignment's post(token, type, data) / get(token, type, params) ----
+    # ---- Generic post(token, type, data) / get(token, type, params) ----
 
     async def Post(self, request, context):
         return await self.business.post(request, context)

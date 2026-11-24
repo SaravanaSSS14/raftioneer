@@ -1,5 +1,7 @@
 # Raftioneer — Distributed Online Auction System
 
+[![tests](https://github.com/SaravanaSSS14/raftioneer/actions/workflows/ci.yml/badge.svg)](https://github.com/SaravanaSSS14/raftioneer/actions/workflows/ci.yml)
+
 A fault-tolerant online auction written in Python. Three auction servers keep identical state by
 replicating every change through **Raft**, implemented from the paper; every service talks
 over **gRPC**; a separate **LLM node** runs a small domain-tuned model on CPU. A web dashboard
@@ -7,9 +9,6 @@ shows the auction, the Raft cluster and the test suites live.
 
 The demo theme is a **campus clearance auction**: at the end of the semester, students list what
 they are leaving behind (a cycle, a mini-fridge, a guitar) and bid on each other's.
-
-*Advanced Operating Systems (CS G623) · BITS Pilani, Pilani Campus · First Semester 2026–27 ·
-Project option F: Distributed Online Auction System*
 
 | | |
 | --- | --- |
@@ -26,7 +25,7 @@ Project option F: Distributed Online Auction System*
 
 1. [Quick start](#1-quick-start)
 2. [Architecture](#2-architecture)
-3. [How the requirements are met](#3-how-the-requirements-are-met)
+3. [What's implemented](#3-whats-implemented)
 4. [The demo dashboard](#4-the-demo-dashboard)
 5. [Fault tolerance](#5-fault-tolerance)
 6. [API](#6-api)
@@ -37,7 +36,7 @@ Project option F: Distributed Online Auction System*
 11. [Troubleshooting](#11-troubleshooting)
 12. [Known limitations and next steps](#12-known-limitations-and-next-steps)
 13. [Repository layout](#13-repository-layout)
-14. [Team](#14-team)
+14. [References](#14-references)
 
 ---
 
@@ -108,11 +107,11 @@ moves the winner's payment into escrow.
 
 ---
 
-## 3. How the requirements are met
+## 3. What's implemented
 
-### Milestone 2: Raft consensus and fault tolerance
+### Raft consensus and fault tolerance
 
-| Requirement | How | Where |
+| Feature | How | Where |
 | --- | --- | --- |
 | Leader election | Randomised timeouts (0.8–1.6 s), terms, one vote per term, the election restriction, and pre-vote | [`app_server/raft/node.py`](app_server/raft/node.py) |
 | Log replication | `AppendEntries` with the consistency check and conflict repair; commit on a majority; a new leader commits a no-op | `raft/node.py` |
@@ -123,9 +122,9 @@ moves the winner's payment into escrow.
 | Fault tolerance during active auctions | The auction clock is driven through the log, so a new leader continues it | [`auction_timer.py`](app_server/auction_timer.py) |
 | Stress testing | 400 simultaneous bids; a write benchmark; a chaos run | [`scripts/stress_bids.py`](scripts/stress_bids.py), [`scripts/benchmark.py`](scripts/benchmark.py), [`scripts/chaos.py`](scripts/chaos.py) |
 
-### Milestone 1: services, business logic and LLM integration
+### Auctions, payments and the LLM assistant
 
-| Requirement | How |
+| Feature | How |
 | --- | --- |
 | Real-time bidding without race conditions | Bids are decided in log order at apply time, plus a compare-and-set update of the highest bid |
 | Auction timer and winner determination | The leader's clock closes expired auctions through the log; the highest bid wins. **Anti-sniping:** a bid in the last 10 s extends the auction |
@@ -136,18 +135,8 @@ moves the winner's payment into escrow.
 | LLM: auction results and pricing trends | A recap of every closed auction, compared with the average sale price |
 | Domain-specific, context-aware LLM on a separate node | A custom model, `raftioneer-tapri`, is built at startup from `qwen2.5:1.5b` with the house persona and rules baked in. Answers are grounded in the handbook and the live auction data. The model is not fine-tuned |
 
-### The assignment's function signatures
-
-| Assignment | Here |
-| --- | --- |
-| `login(username, password)` → `loginResponse(status, token)` | `AuctionService.Login` (and `Register`) |
-| `logout(token)` | `AuctionService.Logout` |
-| `post(token, type, data)` | `AuctionService.Post`: types `bid`, `auction`, `deposit`, `confirm_receipt`, `ask` |
-| `get(token, type, params)` → `getResponse(status, [(id, data)])` | `AuctionService.Get`: types `auctions`, `auction`, `bids`, `summary`, `wallet`, `transactions`, `cluster` |
-| `processBusinessRequest(requestId, payload, context)` | [`business_api.py`](app_server/business_api.py) routes each `post`/`get` to the typed RPC that implements it |
-| `getLLMAnswer(requestId, query, context)` | `LLMService.GetLLMAnswer` (`request_id`, `question`, `context`); the reply echoes `request_id` |
-| `requestVote(from, to, term, lastLogIndex, lastLogTerm)` | `RaftService.RequestVote` (`candidate_id`, `to_id`, ...); the reply carries `from_id`, `to_id`, `term`, `vote_granted` |
-| `appendEntries(from, to, term, prevIndex, prevTerm, commitIndex, entries)` | `RaftService.AppendEntries`; the reply carries `from_id`, `to_id`, `term`, `success` (entryAppended), `match_index` |
+A generic `Post`/`Get` pair ([`business_api.py`](app_server/business_api.py)) gives simple clients one
+entry point; each request is routed by its `type` to the typed RPC that implements it.
 
 ---
 
@@ -385,13 +374,8 @@ tests/             pytest suites (offline and live)
 
 ---
 
-## 14. Team
+## 14. References
 
-| Name | ID |
-| --- | --- |
-| Saravanasudharsan S | 2026H1030068P |
-| Ashutosh Golani | 2026H1030082P |
-
-Reference: D. Ongaro and J. Ousterhout, *In Search of an Understandable Consensus Algorithm
-(Extended Version)*; D. Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis, Section 9.6 on
-pre-vote).
+- D. Ongaro and J. Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
+  Version)*.
+- D. Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis), Section 9.6 on pre-vote.

@@ -1,4 +1,4 @@
-"""The assignment's generic client API: post(token, type, data) and
+"""The generic client API: post(token, type, data) and
 get(token, type, params), served by processBusinessRequest(requestId,
 payload, context).
 
